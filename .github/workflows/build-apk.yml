@@ -39,11 +39,11 @@ jobs:
           path: |
             ~/.buildozer
             smc_apk/.buildozer
-          key: buildozer-v2-${{ runner.os }}-${{ hashFiles('smc_apk/buildozer.spec') }}
+          key: buildozer-v3-${{ runner.os }}-${{ hashFiles('smc_apk/buildozer.spec') }}
           restore-keys: |
-            buildozer-v2-${{ runner.os }}-
+            buildozer-v3-${{ runner.os }}-
 
-      - name: Clean cached dist manifest
+      - name: Clean cached dist
         run: |
           rm -rf smc_apk/.buildozer/android/platform/build-arm64-v8a/dists/smcalert/src/main/AndroidManifest.xml || true
           rm -rf smc_apk/.buildozer/android/platform/build-arm64-v8a/dists/smcalert/build || true
@@ -54,6 +54,39 @@ jobs:
           set -o pipefail
           buildozer android debug 2>&1 | tee /tmp/buildozer.log
           echo "Build exit code: $?"
+
+      - name: Patch manifest and rebuild with BootReceiver
+        working-directory: smc_apk
+        run: |
+          DIST_DIR=".buildozer/android/platform/build-arm64-v8a/dists/smcalert"
+          MANIFEST="$DIST_DIR/src/main/AndroidManifest.xml"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "Manifest not found, skipping patch"
+            exit 0
+          fi
+          if grep -q "BootReceiver" "$MANIFEST"; then
+            echo "BootReceiver already in manifest"
+          else
+            echo "Injecting BootReceiver into AndroidManifest.xml"
+            RECEIVER='<receiver android:name=".BootReceiver" android:enabled="true" android:exported="true"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" \/><action android:name="android.intent.action.QUICKBOOT_POWERON" \/><\/intent-filter><\/receiver>'
+            sed -i "s|</application>|${RECEIVER}</application>|" "$MANIFEST"
+            echo "Manifest patched. Rebuilding APK..."
+            cd "$DIST_DIR"
+            ./gradlew assembleDebug 2>&1 | tail -30
+            echo "Gradle rebuild exit code: $?"
+          fi
+
+      - name: Copy rebuilt APK
+        working-directory: smc_apk
+        run: |
+          REBUILT=".buildozer/android/platform/build-arm64-v8a/dists/smcalert/build/outputs/apk/debug/smcalert-debug.apk"
+          if [ -f "$REBUILT" ]; then
+            cp "$REBUILT" bin/smcalert-1.2.0-arm64-v8a-debug.apk
+            echo "Copied rebuilt APK with BootReceiver"
+          else
+            echo "No rebuilt APK found, using original"
+          fi
+          ls -la bin/*.apk || true
 
       - name: Show errors if failed
         if: failure()
