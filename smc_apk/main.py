@@ -19,7 +19,6 @@ from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.togglebutton import ToggleButton
 from kivy.uix.slider import Slider
-from kivy.uix.scrollview import ScrollView
 from kivy.graphics import Color, Rectangle, Line
 from kivy.core.text import Label as CoreLabel
 from kivy.clock import Clock
@@ -56,7 +55,6 @@ class CandleChart(Widget):
         self._touches = {}
         self._pinch_d0 = None
         self._vsave = None
-        self._last_draw = 0
         self.bind(size=self._redraw, pos=self._redraw)
 
     def set_data(self, data, overlays, tf_sec):
@@ -357,7 +355,6 @@ class SMCAlertApp(App):
         self.cur_tf = DEFAULT_TF
         self._last_ov = None
         self._last_chart_t = 0
-        self._auto_scroll = True
 
         self.replay_enabled = False
         self.replay_playing = False
@@ -365,7 +362,6 @@ class SMCAlertApp(App):
         self._replay_clock = None
 
         self._rest_busy = False
-        self._last_rest_t = 0
 
         threading.Thread(target=self._load, args=(DEFAULT_TF,), daemon=True).start()
         Clock.schedule_interval(self._poll, 0.1)
@@ -380,22 +376,22 @@ class SMCAlertApp(App):
 
     def _build_top_bar(self):
         is_land = Window.width > Window.height
-        bar_h = dp(36) if is_land else dp(48)
+        bar_h = dp(36) if is_land else dp(44)
 
-        self.top_bar = BoxLayout(size_hint_y=None, height=bar_h, spacing=dp(8))
-        self.top_bar.add_widget(Label(text="TF:", size_hint_x=None, width=dp(30),
-                                      color=(1, 1, 1, 0.7), font_size=sp(14)))
+        self.top_bar = BoxLayout(size_hint_y=None, height=bar_h, spacing=dp(4))
+
         self.tf_spin = Spinner(text=DEFAULT_TF, values=TF_LIST,
-                               size_hint_x=None, width=dp(80), font_size=sp(14))
+                               size_hint_x=0.18, font_size=sp(13))
         self.tf_spin.bind(text=self._on_tf)
         self.top_bar.add_widget(self.tf_spin)
 
         self.status = Label(text="Loading...", halign="right", valign="middle",
-                            color=(1, 1, 1, 0.6), font_size=sp(12))
+                            color=(1, 1, 1, 0.6), font_size=sp(11),
+                            size_hint_x=1, shorten=True, shorten_from="left")
         self.status.bind(size=self.status.setter("text_size"))
         self.top_bar.add_widget(self.status)
 
-        fit_btn = Button(text="Fit", size_hint_x=None, width=dp(50), font_size=sp(13))
+        fit_btn = Button(text="Fit", size_hint_x=0.12, font_size=sp(13))
         fit_btn.bind(on_press=lambda *_: self.chart.auto_range())
         self.top_bar.add_widget(fit_btn)
 
@@ -403,45 +399,40 @@ class SMCAlertApp(App):
 
     def _build_replay_bar(self):
         is_land = Window.width > Window.height
-        bar_h = dp(32) if is_land else dp(40)
+        bar_h = dp(32) if is_land else dp(38)
 
-        self.replay_bar = BoxLayout(size_hint_y=None, height=bar_h, spacing=dp(4))
+        self.replay_bar = BoxLayout(size_hint_y=None, height=bar_h, spacing=dp(2))
 
-        self.replay_toggle = ToggleButton(text="Replay", size_hint_x=None, width=dp(70),
-                                          font_size=sp(12))
+        self.replay_toggle = ToggleButton(text="Replay", size_hint_x=0.14, font_size=sp(11))
         self.replay_toggle.bind(state=self._on_replay_toggle)
         self.replay_bar.add_widget(self.replay_toggle)
 
-        self.replay_play_btn = Button(text="Play", size_hint_x=None, width=dp(55),
-                                      font_size=sp(12), disabled=True)
+        self.replay_play_btn = Button(text="Play", size_hint_x=0.1, font_size=sp(11), disabled=True)
         self.replay_play_btn.bind(on_press=self._on_replay_play)
         self.replay_bar.add_widget(self.replay_play_btn)
 
-        self.replay_back_btn = Button(text="<<", size_hint_x=None, width=dp(40),
-                                      font_size=sp(13), disabled=True)
+        self.replay_back_btn = Button(text="<<", size_hint_x=0.07, font_size=sp(12), disabled=True)
         self.replay_back_btn.bind(on_press=lambda *_: self._replay_step(-1))
         self.replay_bar.add_widget(self.replay_back_btn)
 
-        self.replay_fwd_btn = Button(text=">>", size_hint_x=None, width=dp(40),
-                                     font_size=sp(13), disabled=True)
+        self.replay_fwd_btn = Button(text=">>", size_hint_x=0.07, font_size=sp(12), disabled=True)
         self.replay_fwd_btn.bind(on_press=lambda *_: self._replay_step(+1))
         self.replay_bar.add_widget(self.replay_fwd_btn)
 
-        self.replay_bar.add_widget(Label(text="Spd:", size_hint_x=None, width=dp(30),
-                                         color=(1, 1, 1, 0.6), font_size=sp(11)))
         self.replay_speed_spin = Spinner(text="10", values=[str(x) for x in
                                          [1, 2, 5, 10, 20, 50, 100]],
-                                         size_hint_x=None, width=dp(55), font_size=sp(12))
+                                         size_hint_x=0.1, font_size=sp(11))
         self.replay_speed_spin.disabled = True
         self.replay_bar.add_widget(self.replay_speed_spin)
 
-        self.replay_slider = Slider(min=0, max=0, value=0, step=1, disabled=True)
+        self.replay_slider = Slider(min=0, max=0, value=0, step=1, disabled=True,
+                                    size_hint_x=0.35)
         self.replay_slider.bind(value=self._on_replay_slider)
         self.replay_bar.add_widget(self.replay_slider)
 
-        self.replay_info = Label(text="", size_hint_x=None, width=dp(160),
-                                 halign="right", valign="middle",
-                                 color=(1, 1, 1, 0.6), font_size=sp(11))
+        self.replay_info = Label(text="", halign="right", valign="middle",
+                                 color=(1, 1, 1, 0.6), font_size=sp(10),
+                                 size_hint_x=0.17, shorten=True)
         self.replay_info.bind(size=self.replay_info.setter("text_size"))
         self.replay_bar.add_widget(self.replay_info)
 
@@ -458,8 +449,8 @@ class SMCAlertApp(App):
             self.top_bar.height = dp(36)
             self.replay_bar.height = dp(32)
         else:
-            self.top_bar.height = dp(48)
-            self.replay_bar.height = dp(40)
+            self.top_bar.height = dp(44)
+            self.replay_bar.height = dp(38)
 
     def _start_bg_service(self, _dt):
         try:
@@ -469,9 +460,8 @@ class SMCAlertApp(App):
             service_name = str(context.getPackageName()) + ".ServiceMonitor"
             service_cls = autoclass(service_name)
             service_cls.start(activity, "")
-            print("[app] background service started")
-        except Exception as e:
-            print(f"[app] failed to start bg service: {e}")
+        except Exception:
+            pass
 
     def _on_tf(self, _spin, text):
         if self.replay_enabled:
@@ -503,7 +493,6 @@ class SMCAlertApp(App):
             self._notify(at, am)
         self.chart.set_data(data, ov, interval_seconds(tf))
         self.chart.auto_range()
-        self._auto_scroll = True
         n = len(data["time"])
         price = f"${data['close'][-1]:.2f}" if n else ""
         self.status.text = f"{SYMBOL} | {tf} | {n} bars {price}"
@@ -681,7 +670,7 @@ class SMCAlertApp(App):
         self.replay_info.text = f"{i + 1}/{n} | {ts_str}"
         self.status.text = f"{SYMBOL} | {self.cur_tf} | REPLAY | {i + 1} bars"
 
-    # ── live polling ──
+    # ── live polling (WS) ──
 
     def _poll(self, _dt):
         if self.data is None or self.replay_enabled:
@@ -731,7 +720,6 @@ class SMCAlertApp(App):
             for at, am in alerts:
                 self._notify(at, am)
             self.chart.set_data(self.data, ov, interval_seconds(self.cur_tf))
-            self._do_auto_scroll()
             n = len(self.data["time"])
             price = f"${self.data['close'][-1]:.2f}" if n else ""
             self.status.text = f"{SYMBOL} | {self.cur_tf} | {n} bars {price}"
@@ -742,7 +730,6 @@ class SMCAlertApp(App):
                     self.chart.set_data(self.data, self._last_ov, interval_seconds(self.cur_tf))
                 else:
                     self.chart._redraw()
-                self._do_auto_scroll()
                 n = len(self.data["time"])
                 price = f"${self.data['close'][-1]:.2f}" if n else ""
                 self.status.text = f"{SYMBOL} | {self.cur_tf} | {price}"
@@ -832,32 +819,9 @@ class SMCAlertApp(App):
         else:
             self.chart._redraw()
 
-        self._do_auto_scroll()
         n = len(self.data["time"])
         price = f"${self.data['close'][-1]:.2f}" if n else ""
         self.status.text = f"{SYMBOL} | {self.cur_tf} | {n} bars {price}"
-
-    def _do_auto_scroll(self):
-        if not self._auto_scroll or self.data is None:
-            return
-        t = self.data["time"]
-        if len(t) == 0:
-            return
-        last_t = float(t[-1])
-        tf_sec = interval_seconds(self.cur_tf)
-        if self.chart.vt1 >= last_t - tf_sec * 3:
-            self.chart.vt1 = last_t + tf_sec * 5
-            visible_bars = max(10, int((self.chart.vt1 - self.chart.vt0) / max(1, tf_sec)))
-            s = max(0, len(t) - visible_bars)
-            vis_h = self.data["high"][s:]
-            vis_l = self.data["low"][s:]
-            if len(vis_h) > 0:
-                new_p1 = float(np.max(vis_h))
-                new_p0 = float(np.min(vis_l))
-                pad = (new_p1 - new_p0) * 0.05
-                self.chart.vp0 = new_p0 - pad
-                self.chart.vp1 = new_p1 + pad
-            self.chart._redraw()
 
     def on_stop(self):
         self._stop_ws()
