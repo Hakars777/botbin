@@ -39,9 +39,14 @@ jobs:
           path: |
             ~/.buildozer
             smc_apk/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('smc_apk/buildozer.spec') }}
+          key: buildozer-v2-${{ runner.os }}-${{ hashFiles('smc_apk/buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ runner.os }}-
+            buildozer-v2-${{ runner.os }}-
+
+      - name: Clean cached dist manifest
+        run: |
+          rm -rf smc_apk/.buildozer/android/platform/build-arm64-v8a/dists/smcalert/src/main/AndroidManifest.xml || true
+          rm -rf smc_apk/.buildozer/android/platform/build-arm64-v8a/dists/smcalert/build || true
 
       - name: Build APK
         working-directory: smc_apk
