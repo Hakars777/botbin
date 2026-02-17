@@ -1,0 +1,958 @@
+import os
+import sys
+import json
+import time
+import math
+import threading
+from dataclasses import dataclass
+from queue import Queue, Empty
+from datetime import datetime, timezone
+
+import numpy as np
+import requests
+
+os.environ["KIVY_NO_FILELOG"] = "1"
+os.environ["KIVY_NO_CONSOLELOG"] = "0"
+
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.widget import Widget
+from kivy.uix.spinner import Spinner
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.graphics import Color, Rectangle, Line
+from kivy.core.text import Label as CoreLabel
+from kivy.clock import Clock
+from kivy.metrics import dp, sp
+from kivy.core.window import Window
+from kivy.utils import platform
+
+try:
+    from websocket import WebSocketApp
+    HAS_WS = True
+except ImportError:
+    HAS_WS = False
+
+try:
+    from plyer import notification as plyer_notify
+    HAS_PLYER = True
+except ImportError:
+    HAS_PLYER = False
+
+try:
+    import certifi
+    os.environ["SSL_CERT_FILE"] = certifi.where()
+except Exception:
+    pass
+
+# ─── constants ───────────────────────────────────────────────────────
+SYMBOL = "BTCUSDT"
+TF_LIST = ["15m", "4h", "1d"]
+DEFAULT_TF = "15m"
+HIST_BARS = 1000
+
+BULLISH_LEG = 1
+BEARISH_LEG = 0
+BULLISH = 1
+BEARISH = -1
+BOS_TAG = "BOS"
+CHOCH_TAG = "CHoCH"
+
+SWINGS_LEN = 50
+INTERNAL_LEN = 5
+INTERNAL_OB_COUNT = 2
+ATR_LEN = 200
+HIGH_VOL_MULT = 2.0
+FVG_EXTEND = 5
+
+BINANCE_REST = "https://api.binance.com"
+BINANCE_WS_BASE = "wss://stream.binance.com:9443/ws"
+
+
+# ─── helpers ─────────────────────────────────────────────────────────
+def interval_seconds(tf):
+    if tf.endswith("m"):
+        return int(tf[:-1]) * 60
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 3600
+    if tf.endswith("d"):
+        return int(tf[:-1]) * 86400
+    return 60
+
+
+def ms_to_s(ms):
+    return ms / 1000.0
+
+
+def guess_base_tf_sec(t):
+    if t.size < 3:
+        return 60
+    d = np.diff(t)
+    d = d[np.isfinite(d)]
+    if d.size == 0:
+        return 60
+    med = float(np.median(d))
+    if not np.isfinite(med) or med <= 0:
+        return 60
+    return max(1, int(round(med)))
+
+
+def empty_data():
+    return {k: np.array([], dtype=float) for k in ("time", "open", "high", "low", "close", "volume")}
+
+
+# ─── data structures ─────────────────────────────────────────────────
+@dataclass
+class Pivot:
+    currentLevel: float = None
+    lastLevel: float = None
+    crossed: bool = False
+    barTime: float = None
+    barIndex: int = None
+
+
+@dataclass
+class Trend:
+    bias: int = 0
+
+
+@dataclass
+class Trailing:
+    top: float = None
+    bottom: float = None
+    barTime: float = None
+    barIndex: int = None
+    lastTopTime: float = None
+    lastBottomTime: float = None
+
+
+@dataclass
+class OrderBlock:
+    barHigh: float
+    barLow: float
+    barTime: float
+    bias: int
+
+
+@dataclass
+class FVGap:
+    top: float
+    bottom: float
+    bias: int
+    leftTime: float
+    rightTime: float
+
+
+# ─── fetch klines (numpy) ────────────────────────────────────────────
+def fetch_klines(symbol, tf, target_bars):
+    limit = 1000
+    all_data = []
+    end_time = None
+    while len(all_data) < target_bars:
+        params = {"symbol": symbol, "interval": tf, "limit": limit}
+        if end_time is not None:
+            params["endTime"] = end_time
+        r = requests.get(f"{BINANCE_REST}/api/v3/klines", params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            break
+        all_data = data + all_data
+        end_time = int(data[0][0]) - 1
+        if len(data) < limit:
+            break
+        time.sleep(0.05)
+    all_data = all_data[-target_bars:]
+    if not all_data:
+        return empty_data()
+    return {
+        "time": np.array([ms_to_s(int(k[0])) for k in all_data], dtype=float),
+        "open": np.array([float(k[1]) for k in all_data], dtype=float),
+        "high": np.array([float(k[2]) for k in all_data], dtype=float),
+        "low": np.array([float(k[3]) for k in all_data], dtype=float),
+        "close": np.array([float(k[4]) for k in all_data], dtype=float),
+        "volume": np.array([float(k[5]) for k in all_data], dtype=float),
+    }
+
+
+# ─── volatility / ATR ────────────────────────────────────────────────
+def true_range(h, l, pc):
+    return np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+
+
+def atr_wilder(high, low, close, n):
+    pc = np.roll(close, 1); pc[0] = close[0]
+    tr = true_range(high, low, pc)
+    atr = np.zeros_like(tr); atr[0] = tr[0]
+    a = 1.0 / float(n)
+    for i in range(1, len(tr)):
+        atr[i] = (1 - a) * atr[i - 1] + a * tr[i]
+    return atr
+
+
+def parsed_hilo(high, low, atr):
+    hv = (high - low) >= (HIGH_VOL_MULT * atr)
+    return np.where(hv, low, high), np.where(hv, high, low)
+
+
+# ─── leg / crossover ─────────────────────────────────────────────────
+def leg_at(i, size, high, low, prev):
+    if i < size:
+        return prev
+    ch, cl = high[i - size], low[i - size]
+    wh = np.max(high[i - size + 1:i + 1])
+    wl = np.min(low[i - size + 1:i + 1])
+    if ch > wh:
+        return BEARISH_LEG
+    if cl < wl:
+        return BULLISH_LEG
+    return prev
+
+
+def crossover(p, c, lv):
+    return p <= lv and c > lv
+
+
+def crossunder(p, c, lv):
+    return p >= lv and c < lv
+
+
+# ─── merge OBs ────────────────────────────────────────────────────────
+def merge_obs(obs):
+    if not obs:
+        return []
+    by = {BULLISH: [], BEARISH: []}
+    for ob in obs:
+        lo, hi = min(ob.barLow, ob.barHigh), max(ob.barLow, ob.barHigh)
+        by[ob.bias].append(OrderBlock(hi, lo, ob.barTime, ob.bias))
+    merged = []
+    for bias, lst in by.items():
+        if not lst:
+            continue
+        lst.sort(key=lambda x: x.barLow)
+        cur = lst[0]
+        for ob in lst[1:]:
+            if ob.barLow <= cur.barHigh + 1e-12:
+                cur.barHigh = max(cur.barHigh, ob.barHigh)
+                cur.barLow = min(cur.barLow, ob.barLow)
+                cur.barTime = min(cur.barTime, ob.barTime)
+            else:
+                merged.append(cur)
+                cur = ob
+        merged.append(cur)
+    merged.sort(key=lambda x: x.barTime, reverse=True)
+    return merged
+
+
+# ─── compute overlays ─────────────────────────────────────────────────
+def compute_overlays(data, data_4h):
+    t, h, l, c = data["time"], data["high"], data["low"], data["close"]
+    n = len(t)
+    if n < SWINGS_LEN:
+        return {"swing_struct": [], "strongweak": None, "internal_obs": [], "fvgs": []}
+
+    base_sec = guess_base_tf_sec(t)
+    atr = atr_wilder(h, l, c, ATR_LEN)
+    pH, pL = parsed_hilo(h, l, atr)
+
+    sH, sL = Pivot(), Pivot()
+    iH, iL = Pivot(), Pivot()
+    sTr, iTr = Trend(0), Trend(0)
+    trail = Trailing()
+    iobs = []
+    sevts = []
+
+    ls = np.zeros(n, dtype=int)
+    li = np.zeros(n, dtype=int)
+    cs, ci = 0, 0
+    for i in range(n):
+        cs = leg_at(i, SWINGS_LEN, h, l, cs)
+        ci = leg_at(i, INTERNAL_LEN, h, l, ci)
+        ls[i], li[i] = cs, ci
+
+    def _store_ob(piv, bias, ci_):
+        if piv.barIndex is None:
+            return
+        a, b = int(piv.barIndex), int(ci_)
+        if b <= a or a < 0 or b > n:
+            return
+        seg = pH[a:b] if bias == BEARISH else pL[a:b]
+        if seg.size == 0:
+            return
+        idx = a + (int(np.argmax(seg)) if bias == BEARISH else int(np.argmin(seg)))
+        iobs.insert(0, OrderBlock(float(pH[idx]), float(pL[idx]), float(t[idx]), bias))
+        if len(iobs) > 100:
+            iobs.pop()
+
+    def _mitigate(ci_):
+        cH, cL = float(h[ci_]), float(l[ci_])
+        iobs[:] = [ob for ob in iobs
+                    if not (ob.bias == BEARISH and cH > ob.barHigh)
+                    and not (ob.bias == BULLISH and cL < ob.barLow)]
+
+    def _piv_upd(i, sz, internal):
+        if i <= 0:
+            return
+        pi = i - sz
+        if pi < 0:
+            return
+        arr = li if internal else ls
+        ch = int(arr[i]) - int(arr[i - 1])
+        if ch == 0:
+            return
+        if ch == 1:
+            p = iL if internal else sL
+            p.lastLevel, p.currentLevel = p.currentLevel, float(l[pi])
+            p.crossed, p.barTime, p.barIndex = False, float(t[pi]), pi
+            if not internal:
+                trail.bottom = p.currentLevel
+                trail.barTime, trail.barIndex = p.barTime, p.barIndex
+                trail.lastBottomTime = p.barTime
+        elif ch == -1:
+            p = iH if internal else sH
+            p.lastLevel, p.currentLevel = p.currentLevel, float(h[pi])
+            p.crossed, p.barTime, p.barIndex = False, float(t[pi]), pi
+            if not internal:
+                trail.top = p.currentLevel
+                trail.barTime, trail.barIndex = p.barTime, p.barIndex
+                trail.lastTopTime = p.barTime
+
+    for i in range(n):
+        if trail.top is not None and trail.bottom is not None:
+            hi_, lo_ = float(h[i]), float(l[i])
+            if hi_ >= trail.top:
+                trail.top, trail.lastTopTime = hi_, float(t[i])
+            if lo_ <= trail.bottom:
+                trail.bottom, trail.lastBottomTime = lo_, float(t[i])
+
+        _piv_upd(i, SWINGS_LEN, False)
+        _piv_upd(i, INTERNAL_LEN, True)
+
+        pc = float(c[i - 1] if i > 0 else c[i])
+        cc = float(c[i])
+
+        if iH.currentLevel is not None and not iH.crossed:
+            if sH.currentLevel is not None and iH.currentLevel != sH.currentLevel:
+                if crossover(pc, cc, float(iH.currentLevel)):
+                    iH.crossed = True; iTr.bias = BULLISH; _store_ob(iH, BULLISH, i)
+
+        if iL.currentLevel is not None and not iL.crossed:
+            if sL.currentLevel is not None and iL.currentLevel != sL.currentLevel:
+                if crossunder(pc, cc, float(iL.currentLevel)):
+                    iL.crossed = True; iTr.bias = BEARISH; _store_ob(iL, BEARISH, i)
+
+        if sH.currentLevel is not None and sH.barIndex is not None and not sH.crossed:
+            if i > 0 and crossover(float(c[i - 1]), cc, float(sH.currentLevel)):
+                tag = CHOCH_TAG if sTr.bias == BEARISH else BOS_TAG
+                sH.crossed = True; sTr.bias = BULLISH
+                mid = max(0, min(n - 1, int(round(0.5 * (sH.barIndex + i)))))
+                sevts.append({"tag": tag, "level": float(sH.currentLevel),
+                              "t0": float(sH.barTime or t[sH.barIndex]),
+                              "t1": float(t[i]), "tmid": float(t[mid]), "dir": "UP"})
+
+        if sL.currentLevel is not None and sL.barIndex is not None and not sL.crossed:
+            if i > 0 and crossunder(float(c[i - 1]), cc, float(sL.currentLevel)):
+                tag = CHOCH_TAG if sTr.bias == BULLISH else BOS_TAG
+                sL.crossed = True; sTr.bias = BEARISH
+                mid = max(0, min(n - 1, int(round(0.5 * (sL.barIndex + i)))))
+                sevts.append({"tag": tag, "level": float(sL.currentLevel),
+                              "t0": float(sL.barTime or t[sL.barIndex]),
+                              "t1": float(t[i]), "tmid": float(t[mid]), "dir": "DOWN"})
+
+        if i >= 1:
+            _mitigate(i)
+
+    sw = None
+    if (trail.top is not None and trail.bottom is not None
+            and trail.lastTopTime is not None and trail.lastBottomTime is not None):
+        sw = {
+            "top": float(trail.top), "bottom": float(trail.bottom),
+            "top_text": "Strong High" if sTr.bias == BEARISH else "Weak High",
+            "bottom_text": "Strong Low" if sTr.bias == BULLISH else "Weak Low",
+            "lastTopTime": float(trail.lastTopTime),
+            "lastBottomTime": float(trail.lastBottomTime),
+        }
+
+    fvgs = []
+    if data_4h is not None and len(data_4h["time"]) >= 5:
+        t4, o4, h4, l4, c4 = (data_4h[k] for k in ("time", "open", "high", "low", "close"))
+        ext = float(FVG_EXTEND * base_sec)
+        tmp = []
+        cum = 0.0
+        pj = -999999
+        for i in range(n):
+            cL, cH = float(l[i]), float(h[i])
+            tmp[:] = [g for g in tmp
+                      if not (g.bias == BULLISH and cL < g.bottom)
+                      and not (g.bias == BEARISH and cH > g.top)]
+            j = int(np.searchsorted(t4, t[i], side="right") - 1)
+            if j < 0:
+                continue
+            if j != pj and j >= 2:
+                lC, lO, lT = float(c4[j - 1]), float(o4[j - 1]), float(t4[j - 1])
+                cHi, cLo, cT = float(h4[j]), float(l4[j]), float(t4[j])
+                l2H, l2L = float(h4[j - 2]), float(l4[j - 2])
+                dn = lO * 100.0
+                bdp = ((lC - lO) / dn) if abs(dn) > 1e-12 else 0.0
+                cum += abs(bdp)
+                thr = (cum / max(1.0, float(i))) * 2.0
+                if cLo > l2H and lC > l2H and bdp > thr:
+                    tmp.insert(0, FVGap(cLo, l2H, BULLISH, lT, cT + ext))
+                if cHi < l2L and lC < l2L and (-bdp) > thr:
+                    tmp.insert(0, FVGap(cHi, l2L, BEARISH, lT, cT + ext))
+                if len(tmp) > 500:
+                    tmp = tmp[:500]
+            pj = j
+        fvgs = tmp[:200]
+
+    m = merge_obs(iobs)
+    return {"swing_struct": sevts[-250:], "strongweak": sw,
+            "internal_obs": m[:INTERNAL_OB_COUNT], "fvgs": fvgs}
+
+
+# ─── alert tracker ────────────────────────────────────────────────────
+class AlertTracker:
+    def __init__(self):
+        self.prev_bos = set()
+        self.prev_obs = set()
+        self.prev_fvg = set()
+        self.ready = False
+
+    @staticmethod
+    def _bos_key(ev):
+        return f"{ev['dir']}|{ev['level']:.2f}|{int(ev['t1'])}"
+
+    @staticmethod
+    def _ob_key(ob):
+        return f"{ob.bias}|{ob.barTime:.0f}|{ob.barHigh:.2f}|{ob.barLow:.2f}"
+
+    @staticmethod
+    def _fvg_key(g):
+        return f"{g.bias}|{g.leftTime:.0f}|{g.top:.2f}|{g.bottom:.2f}"
+
+    def check(self, ov):
+        alerts = []
+        cur_bos = {self._bos_key(e) for e in ov.get("swing_struct", []) if e["tag"] == BOS_TAG}
+        cur_obs = {self._ob_key(ob) for ob in ov.get("internal_obs", [])}
+        cur_fvg = {self._fvg_key(g) for g in ov.get("fvgs", [])}
+
+        if self.ready:
+            for k in cur_bos - self.prev_bos:
+                p = k.split("|")
+                d = "Bullish" if p[0] == "UP" else "Bearish"
+                alerts.append(("BOS", f"{SYMBOL} {d} BOS @ {p[1]}"))
+            for k in self.prev_obs - cur_obs:
+                p = k.split("|")
+                b = "Bull" if p[0] == "1" else "Bear"
+                alerts.append(("OB Mitigation", f"{SYMBOL} {b} OB mitigated ({p[3]}-{p[2]})"))
+            for k in cur_fvg - self.prev_fvg:
+                p = k.split("|")
+                b = "Bullish" if p[0] == "1" else "Bearish"
+                alerts.append(("FVG", f"{SYMBOL} {b} FVG ({p[3]}-{p[2]})"))
+
+        self.prev_bos, self.prev_obs, self.prev_fvg = cur_bos, cur_obs, cur_fvg
+        if not self.ready:
+            self.ready = True
+        return alerts
+
+
+# ─── websocket worker ─────────────────────────────────────────────────
+class KlineWS:
+    def __init__(self, symbol, tf, q, tag):
+        self.sym = symbol.lower()
+        self.tf = tf
+        self.q = q
+        self.tag = tag
+        self.ws = None
+        self.stop_evt = threading.Event()
+
+    def start(self):
+        self.stop_evt.clear()
+        url = f"{BINANCE_WS_BASE}/{self.sym}@kline_{self.tf}"
+        self.ws = WebSocketApp(url, on_message=self._msg,
+                               on_open=lambda w: None, on_close=lambda w, *a: None,
+                               on_error=lambda w, e: None)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self.stop_evt.set()
+        try:
+            if self.ws:
+                self.ws.close()
+        except Exception:
+            pass
+
+    def _run(self):
+        while not self.stop_evt.is_set():
+            try:
+                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    def _msg(self, ws, message):
+        try:
+            k = json.loads(message).get("k", {})
+            if not k:
+                return
+            self.q.put({"type": "kline", "tag": self.tag,
+                        "t": ms_to_s(int(k["t"])),
+                        "o": float(k["o"]), "h": float(k["h"]),
+                        "l": float(k["l"]), "c": float(k["c"]),
+                        "v": float(k["v"]), "closed": bool(k["x"])})
+        except Exception:
+            pass
+
+
+# ─── kivy chart widget ────────────────────────────────────────────────
+class CandleChart(Widget):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.data = None
+        self.overlays = {}
+        self.tf_sec = 900
+        self.vt0 = 0.0
+        self.vt1 = 1.0
+        self.vp0 = 0.0
+        self.vp1 = 1.0
+        self._touches = {}
+        self._pinch_d0 = None
+        self._vsave = None
+        self._last_draw = 0
+        self.bind(size=self._redraw, pos=self._redraw)
+
+    def set_data(self, data, overlays, tf_sec):
+        self.data = data
+        self.overlays = overlays
+        self.tf_sec = tf_sec
+        self._redraw()
+
+    def auto_range(self, show_last=200):
+        if self.data is None or len(self.data["time"]) == 0:
+            return
+        t, h, l = self.data["time"], self.data["high"], self.data["low"]
+        n = len(t)
+        s = max(0, n - show_last)
+        self.vt0 = float(t[s])
+        self.vt1 = float(t[-1]) + self.tf_sec * 5
+        self.vp0 = float(np.min(l[s:]))
+        self.vp1 = float(np.max(h[s:]))
+        pad = (self.vp1 - self.vp0) * 0.05
+        self.vp0 -= pad
+        self.vp1 += pad
+        self._redraw()
+
+    def t2x(self, t):
+        d = self.vt1 - self.vt0
+        if abs(d) < 1e-9:
+            return self.x
+        return self.x + (t - self.vt0) / d * self.width
+
+    def p2y(self, p):
+        d = self.vp1 - self.vp0
+        if abs(d) < 1e-9:
+            return self.y
+        return self.y + (p - self.vp0) / d * self.height
+
+    def x2t(self, x):
+        return self.vt0 + (x - self.x) / max(1, self.width) * (self.vt1 - self.vt0)
+
+    def y2p(self, y):
+        return self.vp0 + (y - self.y) / max(1, self.height) * (self.vp1 - self.vp0)
+
+    def _grid_step(self):
+        pr = self.vp1 - self.vp0
+        if pr <= 0:
+            return pr
+        raw = pr / 8
+        mag = 10 ** int(math.floor(math.log10(max(1e-10, raw))))
+        for s in [1, 2, 5, 10, 20, 50, 100]:
+            if mag * s >= raw:
+                return mag * s
+        return raw
+
+    # ── drawing ──
+
+    def _redraw(self, *_):
+        self.canvas.clear()
+        with self.canvas:
+            Color(0.06, 0.06, 0.09, 1)
+            Rectangle(pos=self.pos, size=self.size)
+            if self.data is None or len(self.data["time"]) == 0:
+                lbl = CoreLabel(text="Loading...", font_size=sp(18))
+                lbl.refresh()
+                Color(1, 1, 1, 0.5)
+                Rectangle(texture=lbl.texture,
+                          pos=(self.center_x - lbl.texture.width / 2,
+                               self.center_y - lbl.texture.height / 2),
+                          size=lbl.texture.size)
+                return
+            self._draw_grid()
+            self._draw_fvgs()
+            self._draw_obs()
+            self._draw_candles()
+            self._draw_struct()
+            self._draw_sw()
+            self._draw_axes()
+
+    def _draw_grid(self):
+        Color(0.15, 0.15, 0.2, 0.4)
+        step = self._grid_step()
+        if step <= 0:
+            return
+        p = math.ceil(self.vp0 / step) * step
+        cnt = 0
+        while p < self.vp1 and cnt < 50:
+            y = self.p2y(p)
+            Line(points=[self.x, y, self.x + self.width, y], width=0.5)
+            p += step
+            cnt += 1
+
+    def _draw_candles(self):
+        t = self.data["time"]
+        o, h, l, c = self.data["open"], self.data["high"], self.data["low"], self.data["close"]
+        n = len(t)
+        if n == 0:
+            return
+        i0 = max(0, int(np.searchsorted(t, self.vt0, side="left")) - 1)
+        i1 = min(n, int(np.searchsorted(t, self.vt1, side="right")) + 1)
+        bw = self.tf_sec * 0.65
+        for i in range(i0, i1):
+            xc = self.t2x(float(t[i]))
+            yh = self.p2y(float(h[i]))
+            yl = self.p2y(float(l[i]))
+            yo = self.p2y(float(o[i]))
+            yc = self.p2y(float(c[i]))
+            xl = self.t2x(float(t[i]) - bw / 2)
+            xr = self.t2x(float(t[i]) + bw / 2)
+            w = max(1, xr - xl)
+            Color(0.55, 0.55, 0.55, 1)
+            Line(points=[xc, yl, xc, yh], width=1)
+            if c[i] >= o[i]:
+                Color(0.03, 1.0, 0.33, 1)
+            else:
+                Color(0.93, 0.28, 0.03, 1)
+            bb = min(yo, yc)
+            bh = max(1, abs(yc - yo))
+            Rectangle(pos=(xl, bb), size=(w, bh))
+
+    def _draw_struct(self):
+        for ev in self.overlays.get("swing_struct", []):
+            if ev.get("dir") == "UP":
+                Color(0.03, 0.6, 0.5, 0.8)
+            else:
+                Color(0.95, 0.21, 0.27, 0.8)
+            x0 = self.t2x(ev["t0"])
+            x1 = self.t2x(ev["t1"])
+            y = self.p2y(ev["level"])
+            Line(points=[x0, y, x1, y], width=1.5)
+            lbl = CoreLabel(text=ev["tag"], font_size=sp(11))
+            lbl.refresh()
+            xm = self.t2x(ev["tmid"])
+            Color(1, 1, 1, 0.85)
+            Rectangle(texture=lbl.texture,
+                      pos=(xm - lbl.texture.width / 2, y + dp(2)),
+                      size=lbl.texture.size)
+
+    def _draw_obs(self):
+        for ob in self.overlays.get("internal_obs", []):
+            x0 = self.t2x(float(ob.barTime))
+            x1 = self.x + self.width
+            yl = self.p2y(float(min(ob.barLow, ob.barHigh)))
+            yh = self.p2y(float(max(ob.barLow, ob.barHigh)))
+            if yh <= yl:
+                continue
+            if ob.bias == BULLISH:
+                Color(0.19, 0.47, 0.96, 0.3)
+            else:
+                Color(0.97, 0.49, 0.5, 0.3)
+            Rectangle(pos=(x0, yl), size=(max(1, x1 - x0), yh - yl))
+
+    def _draw_fvgs(self):
+        for g in self.overlays.get("fvgs", []):
+            x0 = self.t2x(float(g.leftTime))
+            x1 = self.t2x(float(g.rightTime))
+            yl = self.p2y(float(min(g.top, g.bottom)))
+            yh = self.p2y(float(max(g.top, g.bottom)))
+            if yh <= yl:
+                continue
+            if g.bias == BULLISH:
+                Color(0, 1, 0.41, 0.2)
+            else:
+                Color(1, 0, 0.03, 0.2)
+            Rectangle(pos=(x0, yl), size=(max(1, x1 - x0), yh - yl))
+
+    def _draw_sw(self):
+        sw = self.overlays.get("strongweak")
+        if not sw:
+            return
+        xr = self.x + self.width
+        Color(0.95, 0.21, 0.27, 0.8)
+        yt = self.p2y(sw["top"])
+        Line(points=[self.t2x(sw["lastTopTime"]), yt, xr, yt], width=1.5)
+        lbl = CoreLabel(text=sw["top_text"], font_size=sp(10))
+        lbl.refresh()
+        Color(1, 1, 1, 0.8)
+        Rectangle(texture=lbl.texture,
+                  pos=(xr - lbl.texture.width - dp(4), yt + dp(2)),
+                  size=lbl.texture.size)
+        Color(0.03, 0.6, 0.5, 0.8)
+        yb = self.p2y(sw["bottom"])
+        Line(points=[self.t2x(sw["lastBottomTime"]), yb, xr, yb], width=1.5)
+        lbl = CoreLabel(text=sw["bottom_text"], font_size=sp(10))
+        lbl.refresh()
+        Color(1, 1, 1, 0.8)
+        Rectangle(texture=lbl.texture,
+                  pos=(xr - lbl.texture.width - dp(4), yb + dp(2)),
+                  size=lbl.texture.size)
+
+    def _draw_axes(self):
+        step = self._grid_step()
+        if step <= 0:
+            return
+        p = math.ceil(self.vp0 / step) * step
+        cnt = 0
+        while p < self.vp1 and cnt < 50:
+            y = self.p2y(p)
+            lbl = CoreLabel(text=f"{p:.0f}", font_size=sp(9))
+            lbl.refresh()
+            Color(1, 1, 1, 0.5)
+            Rectangle(texture=lbl.texture,
+                      pos=(self.x + self.width - lbl.texture.width - dp(2),
+                           y - lbl.texture.height / 2),
+                      size=lbl.texture.size)
+            p += step
+            cnt += 1
+
+    # ── touch ──
+
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos):
+            return False
+        if hasattr(touch, "is_mouse_scrolling") and touch.is_mouse_scrolling:
+            f = 0.9 if touch.button == "scrollup" else 1.1
+            mt, mp = self.x2t(touch.pos[0]), self.y2p(touch.pos[1])
+            self.vt0 = mt - (mt - self.vt0) * f
+            self.vt1 = mt + (self.vt1 - mt) * f
+            self.vp0 = mp - (mp - self.vp0) * f
+            self.vp1 = mp + (self.vp1 - mp) * f
+            self._redraw()
+            return True
+        touch.grab(self)
+        self._touches[touch.uid] = touch.pos
+        self._vsave = (self.vt0, self.vt1, self.vp0, self.vp1)
+        if len(self._touches) == 2:
+            pts = list(self._touches.values())
+            self._pinch_d0 = math.dist(pts[0], pts[1])
+        return True
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is not self:
+            return False
+        self._touches[touch.uid] = touch.pos
+        if self._vsave is None:
+            return True
+        vt0, vt1, vp0, vp1 = self._vsave
+        if len(self._touches) == 1:
+            dx = touch.pos[0] - touch.opos[0]
+            dy = touch.pos[1] - touch.opos[1]
+            tr, pr = vt1 - vt0, vp1 - vp0
+            self.vt0 = vt0 - dx / max(1, self.width) * tr
+            self.vt1 = vt1 - dx / max(1, self.width) * tr
+            self.vp0 = vp0 - dy / max(1, self.height) * pr
+            self.vp1 = vp1 - dy / max(1, self.height) * pr
+            self._redraw()
+        elif len(self._touches) == 2 and self._pinch_d0 and self._pinch_d0 > 10:
+            pts = list(self._touches.values())
+            d = math.dist(pts[0], pts[1])
+            if d < 10:
+                return True
+            s = self._pinch_d0 / d
+            tc, pc = (vt0 + vt1) / 2, (vp0 + vp1) / 2
+            self.vt0 = tc - (vt1 - vt0) / 2 * s
+            self.vt1 = tc + (vt1 - vt0) / 2 * s
+            self.vp0 = pc - (vp1 - vp0) / 2 * s
+            self.vp1 = pc + (vp1 - vp0) / 2 * s
+            self._redraw()
+        return True
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is not self:
+            return False
+        touch.ungrab(self)
+        self._touches.pop(touch.uid, None)
+        if not self._touches:
+            self._vsave = None
+            self._pinch_d0 = None
+        return True
+
+
+# ─── kivy app ──────────────────────────────────────────────────────────
+class SMCAlertApp(App):
+    def build(self):
+        self.title = "SMC Alert"
+        Window.clearcolor = (0.06, 0.06, 0.09, 1)
+
+        if platform == "android":
+            try:
+                from android.permissions import request_permissions, Permission
+                request_permissions([Permission.INTERNET, Permission.WAKE_LOCK,
+                                     Permission.POST_NOTIFICATIONS])
+            except Exception:
+                pass
+
+        root = BoxLayout(orientation="vertical", padding=dp(4), spacing=dp(4))
+
+        top = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        top.add_widget(Label(text="TF:", size_hint_x=None, width=dp(30),
+                             color=(1, 1, 1, 0.7), font_size=sp(14)))
+        self.tf_spin = Spinner(text=DEFAULT_TF, values=TF_LIST,
+                               size_hint_x=None, width=dp(80), font_size=sp(14))
+        self.tf_spin.bind(text=self._on_tf)
+        top.add_widget(self.tf_spin)
+
+        self.status = Label(text="Loading...", halign="right", valign="middle",
+                            color=(1, 1, 1, 0.6), font_size=sp(12))
+        self.status.bind(size=self.status.setter("text_size"))
+        top.add_widget(self.status)
+
+        fit_btn = Button(text="Fit", size_hint_x=None, width=dp(50), font_size=sp(13))
+        fit_btn.bind(on_press=lambda *_: self.chart.auto_range())
+        top.add_widget(fit_btn)
+
+        root.add_widget(top)
+        self.chart = CandleChart()
+        root.add_widget(self.chart)
+
+        self.q = Queue()
+        self.ws_tf = None
+        self.ws_4h = None
+        self.data = None
+        self.data_4h = None
+        self.tracker = AlertTracker()
+        self.cur_tf = DEFAULT_TF
+        self._last_ov = None
+        self._last_chart_t = 0
+
+        threading.Thread(target=self._load, args=(DEFAULT_TF,), daemon=True).start()
+        Clock.schedule_interval(self._poll, 0.1)
+        return root
+
+    def _on_tf(self, _spin, text):
+        self.cur_tf = text
+        self.status.text = "Loading..."
+        self._stop_ws()
+        threading.Thread(target=self._load, args=(text,), daemon=True).start()
+
+    def _load(self, tf):
+        try:
+            d = fetch_klines(SYMBOL, tf, HIST_BARS)
+            d4 = fetch_klines(SYMBOL, "4h", max(1000, HIST_BARS // 3))
+            Clock.schedule_once(lambda dt: self._loaded(tf, d, d4))
+        except Exception as e:
+            Clock.schedule_once(lambda dt: setattr(self.status, "text", f"Error: {e}"))
+
+    def _loaded(self, tf, data, data_4h):
+        self.data = data
+        self.data_4h = data_4h
+        self.cur_tf = tf
+        ov = compute_overlays(data, data_4h)
+        self._last_ov = ov
+        alerts = self.tracker.check(ov)
+        for at, am in alerts:
+            self._notify(at, am)
+        self.chart.set_data(data, ov, interval_seconds(tf))
+        self.chart.auto_range()
+        n = len(data["time"])
+        price = f"${data['close'][-1]:.2f}" if n else ""
+        self.status.text = f"{SYMBOL} | {tf} | {n} bars {price}"
+        self._stop_ws()
+        if HAS_WS:
+            self.ws_tf = KlineWS(SYMBOL, tf, self.q, "tf")
+            self.ws_tf.start()
+            self.ws_4h = KlineWS(SYMBOL, "4h", self.q, "4h")
+            self.ws_4h.start()
+
+    def _stop_ws(self):
+        for ws in (self.ws_tf, self.ws_4h):
+            if ws:
+                try:
+                    ws.stop()
+                except Exception:
+                    pass
+        self.ws_tf = self.ws_4h = None
+
+    def _notify(self, title, msg):
+        if HAS_PLYER:
+            try:
+                plyer_notify.notify(title=f"SMC: {title}", message=msg,
+                                    app_name="SMC Alert", timeout=10)
+            except Exception:
+                pass
+
+    def _poll(self, _dt):
+        if self.data is None:
+            return
+        tf_upd = False
+        tf_closed = False
+        h4_closed = False
+        try:
+            while True:
+                msg = self.q.get_nowait()
+                if msg["type"] != "kline":
+                    continue
+                tag = msg["tag"]
+                tt = float(msg["t"])
+                vals = [float(msg["o"]), float(msg["h"]),
+                        float(msg["l"]), float(msg["c"]), float(msg["v"])]
+                closed = bool(msg["closed"])
+                tgt = self.data_4h if tag == "4h" else self.data
+                if tgt is None or len(tgt["time"]) == 0:
+                    continue
+                last_t = float(tgt["time"][-1])
+                if abs(tt - last_t) < 1e-9:
+                    for i, k in enumerate(("open", "high", "low", "close", "volume")):
+                        tgt[k][-1] = vals[i]
+                elif tt > last_t:
+                    tgt["time"] = np.append(tgt["time"], tt)
+                    for i, k in enumerate(("open", "high", "low", "close", "volume")):
+                        tgt[k] = np.append(tgt[k], vals[i])
+                    mx = 4500 if tag == "4h" else HIST_BARS
+                    if len(tgt["time"]) > mx:
+                        for k in tgt:
+                            tgt[k] = tgt[k][-mx:]
+                if tag == "4h":
+                    if closed:
+                        h4_closed = True
+                else:
+                    tf_upd = True
+                    if closed:
+                        tf_closed = True
+        except Empty:
+            pass
+
+        if tf_closed or h4_closed:
+            ov = compute_overlays(self.data, self.data_4h)
+            self._last_ov = ov
+            alerts = self.tracker.check(ov)
+            for at, am in alerts:
+                self._notify(at, am)
+            self.chart.set_data(self.data, ov, interval_seconds(self.cur_tf))
+            n = len(self.data["time"])
+            price = f"${self.data['close'][-1]:.2f}" if n else ""
+            self.status.text = f"{SYMBOL} | {self.cur_tf} | {n} bars {price}"
+        elif tf_upd and self._last_ov:
+            now = time.time()
+            if now - self._last_chart_t > 1.0:
+                self.chart.set_data(self.data, self._last_ov, interval_seconds(self.cur_tf))
+                n = len(self.data["time"])
+                price = f"${self.data['close'][-1]:.2f}" if n else ""
+                self.status.text = f"{SYMBOL} | {self.cur_tf} | {price}"
+                self._last_chart_t = now
+
+    def on_stop(self):
+        self._stop_ws()
+
+
+if __name__ == "__main__":
+    SMCAlertApp().run()
