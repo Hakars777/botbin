@@ -1,15 +1,12 @@
 import os
 import sys
-import json
 import time
 import math
 import threading
-from dataclasses import dataclass
 from queue import Queue, Empty
 from datetime import datetime, timezone
 
 import numpy as np
-import requests
 
 os.environ["KIVY_NO_FILELOG"] = "1"
 os.environ["KIVY_NO_CONSOLELOG"] = "0"
@@ -22,6 +19,7 @@ from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.togglebutton import ToggleButton
 from kivy.uix.slider import Slider
+from kivy.uix.scrollview import ScrollView
 from kivy.graphics import Color, Rectangle, Line
 from kivy.core.text import Label as CoreLabel
 from kivy.clock import Clock
@@ -29,481 +27,19 @@ from kivy.metrics import dp, sp
 from kivy.core.window import Window
 from kivy.utils import platform
 
-try:
-    from websocket import WebSocketApp
-    HAS_WS = True
-except ImportError:
-    HAS_WS = False
+from engine import (
+    SYMBOL, TF_LIST, DEFAULT_TF, HIST_BARS,
+    BULLISH, BEARISH, BULLISH_LEG, BEARISH_LEG,
+    BOS_TAG, CHOCH_TAG,
+    HAS_WS, interval_seconds, fetch_klines, compute_overlays,
+    AlertTracker, KlineWS, empty_data
+)
 
 try:
     from plyer import notification as plyer_notify
     HAS_PLYER = True
 except ImportError:
     HAS_PLYER = False
-
-try:
-    import certifi
-    os.environ["SSL_CERT_FILE"] = certifi.where()
-except Exception:
-    pass
-
-# ─── constants ───────────────────────────────────────────────────────
-SYMBOL = "BTCUSDT"
-TF_LIST = ["15m", "4h", "1d"]
-DEFAULT_TF = "15m"
-HIST_BARS = 1000
-
-BULLISH_LEG = 1
-BEARISH_LEG = 0
-BULLISH = 1
-BEARISH = -1
-BOS_TAG = "BOS"
-CHOCH_TAG = "CHoCH"
-
-SWINGS_LEN = 50
-INTERNAL_LEN = 5
-INTERNAL_OB_COUNT = 2
-ATR_LEN = 200
-HIGH_VOL_MULT = 2.0
-FVG_EXTEND = 5
-
-BINANCE_REST = "https://api.binance.com"
-BINANCE_WS_BASE = "wss://stream.binance.com:9443/ws"
-
-
-# ─── helpers ─────────────────────────────────────────────────────────
-def interval_seconds(tf):
-    if tf.endswith("m"):
-        return int(tf[:-1]) * 60
-    if tf.endswith("h"):
-        return int(tf[:-1]) * 3600
-    if tf.endswith("d"):
-        return int(tf[:-1]) * 86400
-    return 60
-
-
-def ms_to_s(ms):
-    return ms / 1000.0
-
-
-def guess_base_tf_sec(t):
-    if t.size < 3:
-        return 60
-    d = np.diff(t)
-    d = d[np.isfinite(d)]
-    if d.size == 0:
-        return 60
-    med = float(np.median(d))
-    if not np.isfinite(med) or med <= 0:
-        return 60
-    return max(1, int(round(med)))
-
-
-def empty_data():
-    return {k: np.array([], dtype=float) for k in ("time", "open", "high", "low", "close", "volume")}
-
-
-# ─── data structures ─────────────────────────────────────────────────
-@dataclass
-class Pivot:
-    currentLevel: float = None
-    lastLevel: float = None
-    crossed: bool = False
-    barTime: float = None
-    barIndex: int = None
-
-
-@dataclass
-class Trend:
-    bias: int = 0
-
-
-@dataclass
-class Trailing:
-    top: float = None
-    bottom: float = None
-    barTime: float = None
-    barIndex: int = None
-    lastTopTime: float = None
-    lastBottomTime: float = None
-
-
-@dataclass
-class OrderBlock:
-    barHigh: float
-    barLow: float
-    barTime: float
-    bias: int
-
-
-@dataclass
-class FVGap:
-    top: float
-    bottom: float
-    bias: int
-    leftTime: float
-    rightTime: float
-
-
-# ─── fetch klines (numpy) ────────────────────────────────────────────
-def fetch_klines(symbol, tf, target_bars):
-    limit = 1000
-    all_data = []
-    end_time = None
-    while len(all_data) < target_bars:
-        params = {"symbol": symbol, "interval": tf, "limit": limit}
-        if end_time is not None:
-            params["endTime"] = end_time
-        r = requests.get(f"{BINANCE_REST}/api/v3/klines", params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            break
-        all_data = data + all_data
-        end_time = int(data[0][0]) - 1
-        if len(data) < limit:
-            break
-        time.sleep(0.05)
-    all_data = all_data[-target_bars:]
-    if not all_data:
-        return empty_data()
-    return {
-        "time": np.array([ms_to_s(int(k[0])) for k in all_data], dtype=float),
-        "open": np.array([float(k[1]) for k in all_data], dtype=float),
-        "high": np.array([float(k[2]) for k in all_data], dtype=float),
-        "low": np.array([float(k[3]) for k in all_data], dtype=float),
-        "close": np.array([float(k[4]) for k in all_data], dtype=float),
-        "volume": np.array([float(k[5]) for k in all_data], dtype=float),
-    }
-
-
-# ─── volatility / ATR ────────────────────────────────────────────────
-def true_range(h, l, pc):
-    return np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
-
-
-def atr_wilder(high, low, close, n):
-    pc = np.roll(close, 1); pc[0] = close[0]
-    tr = true_range(high, low, pc)
-    atr = np.zeros_like(tr); atr[0] = tr[0]
-    a = 1.0 / float(n)
-    for i in range(1, len(tr)):
-        atr[i] = (1 - a) * atr[i - 1] + a * tr[i]
-    return atr
-
-
-def parsed_hilo(high, low, atr):
-    hv = (high - low) >= (HIGH_VOL_MULT * atr)
-    return np.where(hv, low, high), np.where(hv, high, low)
-
-
-# ─── leg / crossover ─────────────────────────────────────────────────
-def leg_at(i, size, high, low, prev):
-    if i < size:
-        return prev
-    ch, cl = high[i - size], low[i - size]
-    wh = np.max(high[i - size + 1:i + 1])
-    wl = np.min(low[i - size + 1:i + 1])
-    if ch > wh:
-        return BEARISH_LEG
-    if cl < wl:
-        return BULLISH_LEG
-    return prev
-
-
-def crossover(p, c, lv):
-    return p <= lv and c > lv
-
-
-def crossunder(p, c, lv):
-    return p >= lv and c < lv
-
-
-# ─── merge OBs ────────────────────────────────────────────────────────
-def merge_obs(obs):
-    if not obs:
-        return []
-    by = {BULLISH: [], BEARISH: []}
-    for ob in obs:
-        lo, hi = min(ob.barLow, ob.barHigh), max(ob.barLow, ob.barHigh)
-        by[ob.bias].append(OrderBlock(hi, lo, ob.barTime, ob.bias))
-    merged = []
-    for bias, lst in by.items():
-        if not lst:
-            continue
-        lst.sort(key=lambda x: x.barLow)
-        cur = lst[0]
-        for ob in lst[1:]:
-            if ob.barLow <= cur.barHigh + 1e-12:
-                cur.barHigh = max(cur.barHigh, ob.barHigh)
-                cur.barLow = min(cur.barLow, ob.barLow)
-                cur.barTime = min(cur.barTime, ob.barTime)
-            else:
-                merged.append(cur)
-                cur = ob
-        merged.append(cur)
-    merged.sort(key=lambda x: x.barTime, reverse=True)
-    return merged
-
-
-# ─── compute overlays ─────────────────────────────────────────────────
-def compute_overlays(data, data_4h):
-    t, h, l, c = data["time"], data["high"], data["low"], data["close"]
-    n = len(t)
-    if n < SWINGS_LEN:
-        return {"swing_struct": [], "strongweak": None, "internal_obs": [], "fvgs": []}
-
-    base_sec = guess_base_tf_sec(t)
-    atr = atr_wilder(h, l, c, ATR_LEN)
-    pH, pL = parsed_hilo(h, l, atr)
-
-    sH, sL = Pivot(), Pivot()
-    iH, iL = Pivot(), Pivot()
-    sTr, iTr = Trend(0), Trend(0)
-    trail = Trailing()
-    iobs = []
-    sevts = []
-
-    ls = np.zeros(n, dtype=int)
-    li = np.zeros(n, dtype=int)
-    cs, ci = 0, 0
-    for i in range(n):
-        cs = leg_at(i, SWINGS_LEN, h, l, cs)
-        ci = leg_at(i, INTERNAL_LEN, h, l, ci)
-        ls[i], li[i] = cs, ci
-
-    def _store_ob(piv, bias, ci_):
-        if piv.barIndex is None:
-            return
-        a, b = int(piv.barIndex), int(ci_)
-        if b <= a or a < 0 or b > n:
-            return
-        seg = pH[a:b] if bias == BEARISH else pL[a:b]
-        if seg.size == 0:
-            return
-        idx = a + (int(np.argmax(seg)) if bias == BEARISH else int(np.argmin(seg)))
-        iobs.insert(0, OrderBlock(float(pH[idx]), float(pL[idx]), float(t[idx]), bias))
-        if len(iobs) > 100:
-            iobs.pop()
-
-    def _mitigate(ci_):
-        cH, cL = float(h[ci_]), float(l[ci_])
-        iobs[:] = [ob for ob in iobs
-                    if not (ob.bias == BEARISH and cH > ob.barHigh)
-                    and not (ob.bias == BULLISH and cL < ob.barLow)]
-
-    def _piv_upd(i, sz, internal):
-        if i <= 0:
-            return
-        pi = i - sz
-        if pi < 0:
-            return
-        arr = li if internal else ls
-        ch = int(arr[i]) - int(arr[i - 1])
-        if ch == 0:
-            return
-        if ch == 1:
-            p = iL if internal else sL
-            p.lastLevel, p.currentLevel = p.currentLevel, float(l[pi])
-            p.crossed, p.barTime, p.barIndex = False, float(t[pi]), pi
-            if not internal:
-                trail.bottom = p.currentLevel
-                trail.barTime, trail.barIndex = p.barTime, p.barIndex
-                trail.lastBottomTime = p.barTime
-        elif ch == -1:
-            p = iH if internal else sH
-            p.lastLevel, p.currentLevel = p.currentLevel, float(h[pi])
-            p.crossed, p.barTime, p.barIndex = False, float(t[pi]), pi
-            if not internal:
-                trail.top = p.currentLevel
-                trail.barTime, trail.barIndex = p.barTime, p.barIndex
-                trail.lastTopTime = p.barTime
-
-    for i in range(n):
-        if trail.top is not None and trail.bottom is not None:
-            hi_, lo_ = float(h[i]), float(l[i])
-            if hi_ >= trail.top:
-                trail.top, trail.lastTopTime = hi_, float(t[i])
-            if lo_ <= trail.bottom:
-                trail.bottom, trail.lastBottomTime = lo_, float(t[i])
-
-        _piv_upd(i, SWINGS_LEN, False)
-        _piv_upd(i, INTERNAL_LEN, True)
-
-        pc = float(c[i - 1] if i > 0 else c[i])
-        cc = float(c[i])
-
-        if iH.currentLevel is not None and not iH.crossed:
-            if sH.currentLevel is not None and iH.currentLevel != sH.currentLevel:
-                if crossover(pc, cc, float(iH.currentLevel)):
-                    iH.crossed = True; iTr.bias = BULLISH; _store_ob(iH, BULLISH, i)
-
-        if iL.currentLevel is not None and not iL.crossed:
-            if sL.currentLevel is not None and iL.currentLevel != sL.currentLevel:
-                if crossunder(pc, cc, float(iL.currentLevel)):
-                    iL.crossed = True; iTr.bias = BEARISH; _store_ob(iL, BEARISH, i)
-
-        if sH.currentLevel is not None and sH.barIndex is not None and not sH.crossed:
-            if i > 0 and crossover(float(c[i - 1]), cc, float(sH.currentLevel)):
-                tag = CHOCH_TAG if sTr.bias == BEARISH else BOS_TAG
-                sH.crossed = True; sTr.bias = BULLISH
-                mid = max(0, min(n - 1, int(round(0.5 * (sH.barIndex + i)))))
-                sevts.append({"tag": tag, "level": float(sH.currentLevel),
-                              "t0": float(sH.barTime or t[sH.barIndex]),
-                              "t1": float(t[i]), "tmid": float(t[mid]), "dir": "UP"})
-
-        if sL.currentLevel is not None and sL.barIndex is not None and not sL.crossed:
-            if i > 0 and crossunder(float(c[i - 1]), cc, float(sL.currentLevel)):
-                tag = CHOCH_TAG if sTr.bias == BULLISH else BOS_TAG
-                sL.crossed = True; sTr.bias = BEARISH
-                mid = max(0, min(n - 1, int(round(0.5 * (sL.barIndex + i)))))
-                sevts.append({"tag": tag, "level": float(sL.currentLevel),
-                              "t0": float(sL.barTime or t[sL.barIndex]),
-                              "t1": float(t[i]), "tmid": float(t[mid]), "dir": "DOWN"})
-
-        if i >= 1:
-            _mitigate(i)
-
-    sw = None
-    if (trail.top is not None and trail.bottom is not None
-            and trail.lastTopTime is not None and trail.lastBottomTime is not None):
-        sw = {
-            "top": float(trail.top), "bottom": float(trail.bottom),
-            "top_text": "Strong High" if sTr.bias == BEARISH else "Weak High",
-            "bottom_text": "Strong Low" if sTr.bias == BULLISH else "Weak Low",
-            "lastTopTime": float(trail.lastTopTime),
-            "lastBottomTime": float(trail.lastBottomTime),
-        }
-
-    fvgs = []
-    if data_4h is not None and len(data_4h["time"]) >= 5:
-        t4, o4, h4, l4, c4 = (data_4h[k] for k in ("time", "open", "high", "low", "close"))
-        ext = float(FVG_EXTEND * base_sec)
-        tmp = []
-        cum = 0.0
-        pj = -999999
-        for i in range(n):
-            cL, cH = float(l[i]), float(h[i])
-            tmp[:] = [g for g in tmp
-                      if not (g.bias == BULLISH and cL < g.bottom)
-                      and not (g.bias == BEARISH and cH > g.top)]
-            j = int(np.searchsorted(t4, t[i], side="right") - 1)
-            if j < 0:
-                continue
-            if j != pj and j >= 2:
-                lC, lO, lT = float(c4[j - 1]), float(o4[j - 1]), float(t4[j - 1])
-                cHi, cLo, cT = float(h4[j]), float(l4[j]), float(t4[j])
-                l2H, l2L = float(h4[j - 2]), float(l4[j - 2])
-                dn = lO * 100.0
-                bdp = ((lC - lO) / dn) if abs(dn) > 1e-12 else 0.0
-                cum += abs(bdp)
-                thr = (cum / max(1.0, float(i))) * 2.0
-                if cLo > l2H and lC > l2H and bdp > thr:
-                    tmp.insert(0, FVGap(cLo, l2H, BULLISH, lT, cT + ext))
-                if cHi < l2L and lC < l2L and (-bdp) > thr:
-                    tmp.insert(0, FVGap(cHi, l2L, BEARISH, lT, cT + ext))
-                if len(tmp) > 500:
-                    tmp = tmp[:500]
-            pj = j
-        fvgs = tmp[:200]
-
-    m = merge_obs(iobs)
-    return {"swing_struct": sevts[-250:], "strongweak": sw,
-            "internal_obs": m[:INTERNAL_OB_COUNT], "fvgs": fvgs}
-
-
-# ─── alert tracker ────────────────────────────────────────────────────
-class AlertTracker:
-    def __init__(self):
-        self.prev_bos = set()
-        self.prev_obs = set()
-        self.prev_fvg = set()
-        self.ready = False
-
-    @staticmethod
-    def _bos_key(ev):
-        return f"{ev['dir']}|{ev['level']:.2f}|{int(ev['t1'])}"
-
-    @staticmethod
-    def _ob_key(ob):
-        return f"{ob.bias}|{ob.barTime:.0f}|{ob.barHigh:.2f}|{ob.barLow:.2f}"
-
-    @staticmethod
-    def _fvg_key(g):
-        return f"{g.bias}|{g.leftTime:.0f}|{g.top:.2f}|{g.bottom:.2f}"
-
-    def check(self, ov):
-        alerts = []
-        cur_bos = {self._bos_key(e) for e in ov.get("swing_struct", []) if e["tag"] == BOS_TAG}
-        cur_obs = {self._ob_key(ob) for ob in ov.get("internal_obs", [])}
-        cur_fvg = {self._fvg_key(g) for g in ov.get("fvgs", [])}
-
-        if self.ready:
-            for k in cur_bos - self.prev_bos:
-                p = k.split("|")
-                d = "Bullish" if p[0] == "UP" else "Bearish"
-                alerts.append(("BOS", f"{SYMBOL} {d} BOS @ {p[1]}"))
-            for k in self.prev_obs - cur_obs:
-                p = k.split("|")
-                b = "Bull" if p[0] == "1" else "Bear"
-                alerts.append(("OB Mitigation", f"{SYMBOL} {b} OB mitigated ({p[3]}-{p[2]})"))
-            for k in cur_fvg - self.prev_fvg:
-                p = k.split("|")
-                b = "Bullish" if p[0] == "1" else "Bearish"
-                alerts.append(("FVG", f"{SYMBOL} {b} FVG ({p[3]}-{p[2]})"))
-
-        self.prev_bos, self.prev_obs, self.prev_fvg = cur_bos, cur_obs, cur_fvg
-        if not self.ready:
-            self.ready = True
-        return alerts
-
-
-# ─── websocket worker ─────────────────────────────────────────────────
-class KlineWS:
-    def __init__(self, symbol, tf, q, tag):
-        self.sym = symbol.lower()
-        self.tf = tf
-        self.q = q
-        self.tag = tag
-        self.ws = None
-        self.stop_evt = threading.Event()
-
-    def start(self):
-        self.stop_evt.clear()
-        url = f"{BINANCE_WS_BASE}/{self.sym}@kline_{self.tf}"
-        self.ws = WebSocketApp(url, on_message=self._msg,
-                               on_open=lambda w: None, on_close=lambda w, *a: None,
-                               on_error=lambda w, e: None)
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def stop(self):
-        self.stop_evt.set()
-        try:
-            if self.ws:
-                self.ws.close()
-        except Exception:
-            pass
-
-    def _run(self):
-        while not self.stop_evt.is_set():
-            try:
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
-            except Exception:
-                pass
-            time.sleep(1.0)
-
-    def _msg(self, ws, message):
-        try:
-            k = json.loads(message).get("k", {})
-            if not k:
-                return
-            self.q.put({"type": "kline", "tag": self.tag,
-                        "t": ms_to_s(int(k["t"])),
-                        "o": float(k["o"]), "h": float(k["h"]),
-                        "l": float(k["l"]), "c": float(k["c"]),
-                        "v": float(k["v"]), "closed": bool(k["x"])})
-        except Exception:
-            pass
 
 
 # ─── kivy chart widget ────────────────────────────────────────────────
@@ -572,8 +108,6 @@ class CandleChart(Widget):
             if mag * s >= raw:
                 return mag * s
         return raw
-
-    # ── drawing ──
 
     def _redraw(self, *_):
         self.canvas.clear()
@@ -726,8 +260,6 @@ class CandleChart(Widget):
             p += step
             cnt += 1
 
-    # ── touch ──
-
     def on_touch_down(self, touch):
         if not self.collide_point(*touch.pos):
             return False
@@ -799,76 +331,20 @@ class SMCAlertApp(App):
             try:
                 from android.permissions import request_permissions, Permission
                 request_permissions([Permission.INTERNET, Permission.WAKE_LOCK,
-                                     Permission.POST_NOTIFICATIONS])
+                                     Permission.POST_NOTIFICATIONS,
+                                     Permission.FOREGROUND_SERVICE])
             except Exception:
                 pass
 
-        root = BoxLayout(orientation="vertical", padding=dp(4), spacing=dp(4))
+        self._is_landscape = Window.width > Window.height
 
-        top = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-        top.add_widget(Label(text="TF:", size_hint_x=None, width=dp(30),
-                             color=(1, 1, 1, 0.7), font_size=sp(14)))
-        self.tf_spin = Spinner(text=DEFAULT_TF, values=TF_LIST,
-                               size_hint_x=None, width=dp(80), font_size=sp(14))
-        self.tf_spin.bind(text=self._on_tf)
-        top.add_widget(self.tf_spin)
+        self.root_box = BoxLayout(orientation="vertical", padding=dp(4), spacing=dp(4))
 
-        self.status = Label(text="Loading...", halign="right", valign="middle",
-                            color=(1, 1, 1, 0.6), font_size=sp(12))
-        self.status.bind(size=self.status.setter("text_size"))
-        top.add_widget(self.status)
-
-        fit_btn = Button(text="Fit", size_hint_x=None, width=dp(50), font_size=sp(13))
-        fit_btn.bind(on_press=lambda *_: self.chart.auto_range())
-        top.add_widget(fit_btn)
-
-        root.add_widget(top)
-
-        # ── replay bar ──
-        rbar = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
-
-        self.replay_toggle = ToggleButton(text="Replay", size_hint_x=None, width=dp(70),
-                                          font_size=sp(12))
-        self.replay_toggle.bind(state=self._on_replay_toggle)
-        rbar.add_widget(self.replay_toggle)
-
-        self.replay_play_btn = Button(text="Play", size_hint_x=None, width=dp(55),
-                                      font_size=sp(12), disabled=True)
-        self.replay_play_btn.bind(on_press=self._on_replay_play)
-        rbar.add_widget(self.replay_play_btn)
-
-        self.replay_back_btn = Button(text="<<", size_hint_x=None, width=dp(40),
-                                      font_size=sp(13), disabled=True)
-        self.replay_back_btn.bind(on_press=lambda *_: self._replay_step(-1))
-        rbar.add_widget(self.replay_back_btn)
-
-        self.replay_fwd_btn = Button(text=">>", size_hint_x=None, width=dp(40),
-                                     font_size=sp(13), disabled=True)
-        self.replay_fwd_btn.bind(on_press=lambda *_: self._replay_step(+1))
-        rbar.add_widget(self.replay_fwd_btn)
-
-        rbar.add_widget(Label(text="Spd:", size_hint_x=None, width=dp(30),
-                              color=(1, 1, 1, 0.6), font_size=sp(11)))
-        self.replay_speed_spin = Spinner(text="10", values=[str(x) for x in
-                                         [1, 2, 5, 10, 20, 50, 100]],
-                                         size_hint_x=None, width=dp(55), font_size=sp(12))
-        self.replay_speed_spin.disabled = True
-        rbar.add_widget(self.replay_speed_spin)
-
-        self.replay_slider = Slider(min=0, max=0, value=0, step=1, disabled=True)
-        self.replay_slider.bind(value=self._on_replay_slider)
-        rbar.add_widget(self.replay_slider)
-
-        self.replay_info = Label(text="", size_hint_x=None, width=dp(180),
-                                 halign="right", valign="middle",
-                                 color=(1, 1, 1, 0.6), font_size=sp(11))
-        self.replay_info.bind(size=self.replay_info.setter("text_size"))
-        rbar.add_widget(self.replay_info)
-
-        root.add_widget(rbar)
+        self._build_top_bar()
+        self._build_replay_bar()
 
         self.chart = CandleChart()
-        root.add_widget(self.chart)
+        self.root_box.add_widget(self.chart)
 
         self.q = Queue()
         self.ws_tf = None
@@ -881,8 +357,8 @@ class SMCAlertApp(App):
         self.cur_tf = DEFAULT_TF
         self._last_ov = None
         self._last_chart_t = 0
+        self._auto_scroll = True
 
-        # replay state
         self.replay_enabled = False
         self.replay_playing = False
         self.replay_index = 0
@@ -890,7 +366,108 @@ class SMCAlertApp(App):
 
         threading.Thread(target=self._load, args=(DEFAULT_TF,), daemon=True).start()
         Clock.schedule_interval(self._poll, 0.1)
-        return root
+
+        Window.bind(on_resize=self._on_window_resize)
+
+        if platform == "android":
+            Clock.schedule_once(self._start_bg_service, 3)
+
+        return self.root_box
+
+    def _build_top_bar(self):
+        is_land = Window.width > Window.height
+        bar_h = dp(36) if is_land else dp(48)
+
+        self.top_bar = BoxLayout(size_hint_y=None, height=bar_h, spacing=dp(8))
+        self.top_bar.add_widget(Label(text="TF:", size_hint_x=None, width=dp(30),
+                                      color=(1, 1, 1, 0.7), font_size=sp(14)))
+        self.tf_spin = Spinner(text=DEFAULT_TF, values=TF_LIST,
+                               size_hint_x=None, width=dp(80), font_size=sp(14))
+        self.tf_spin.bind(text=self._on_tf)
+        self.top_bar.add_widget(self.tf_spin)
+
+        self.status = Label(text="Loading...", halign="right", valign="middle",
+                            color=(1, 1, 1, 0.6), font_size=sp(12))
+        self.status.bind(size=self.status.setter("text_size"))
+        self.top_bar.add_widget(self.status)
+
+        fit_btn = Button(text="Fit", size_hint_x=None, width=dp(50), font_size=sp(13))
+        fit_btn.bind(on_press=lambda *_: self.chart.auto_range())
+        self.top_bar.add_widget(fit_btn)
+
+        self.root_box.add_widget(self.top_bar)
+
+    def _build_replay_bar(self):
+        is_land = Window.width > Window.height
+        bar_h = dp(32) if is_land else dp(40)
+
+        self.replay_bar = BoxLayout(size_hint_y=None, height=bar_h, spacing=dp(4))
+
+        self.replay_toggle = ToggleButton(text="Replay", size_hint_x=None, width=dp(70),
+                                          font_size=sp(12))
+        self.replay_toggle.bind(state=self._on_replay_toggle)
+        self.replay_bar.add_widget(self.replay_toggle)
+
+        self.replay_play_btn = Button(text="Play", size_hint_x=None, width=dp(55),
+                                      font_size=sp(12), disabled=True)
+        self.replay_play_btn.bind(on_press=self._on_replay_play)
+        self.replay_bar.add_widget(self.replay_play_btn)
+
+        self.replay_back_btn = Button(text="<<", size_hint_x=None, width=dp(40),
+                                      font_size=sp(13), disabled=True)
+        self.replay_back_btn.bind(on_press=lambda *_: self._replay_step(-1))
+        self.replay_bar.add_widget(self.replay_back_btn)
+
+        self.replay_fwd_btn = Button(text=">>", size_hint_x=None, width=dp(40),
+                                     font_size=sp(13), disabled=True)
+        self.replay_fwd_btn.bind(on_press=lambda *_: self._replay_step(+1))
+        self.replay_bar.add_widget(self.replay_fwd_btn)
+
+        self.replay_bar.add_widget(Label(text="Spd:", size_hint_x=None, width=dp(30),
+                                         color=(1, 1, 1, 0.6), font_size=sp(11)))
+        self.replay_speed_spin = Spinner(text="10", values=[str(x) for x in
+                                         [1, 2, 5, 10, 20, 50, 100]],
+                                         size_hint_x=None, width=dp(55), font_size=sp(12))
+        self.replay_speed_spin.disabled = True
+        self.replay_bar.add_widget(self.replay_speed_spin)
+
+        self.replay_slider = Slider(min=0, max=0, value=0, step=1, disabled=True)
+        self.replay_slider.bind(value=self._on_replay_slider)
+        self.replay_bar.add_widget(self.replay_slider)
+
+        self.replay_info = Label(text="", size_hint_x=None, width=dp(160),
+                                 halign="right", valign="middle",
+                                 color=(1, 1, 1, 0.6), font_size=sp(11))
+        self.replay_info.bind(size=self.replay_info.setter("text_size"))
+        self.replay_bar.add_widget(self.replay_info)
+
+        self.root_box.add_widget(self.replay_bar)
+
+    def _on_window_resize(self, window, w, h):
+        is_land = w > h
+        if is_land != self._is_landscape:
+            self._is_landscape = is_land
+            self._adapt_layout(is_land)
+
+    def _adapt_layout(self, is_land):
+        if is_land:
+            self.top_bar.height = dp(36)
+            self.replay_bar.height = dp(32)
+        else:
+            self.top_bar.height = dp(48)
+            self.replay_bar.height = dp(40)
+
+    def _start_bg_service(self, _dt):
+        try:
+            from jnius import autoclass
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            context = activity.getApplicationContext()
+            service_name = str(context.getPackageName()) + ".ServiceMonitor"
+            service_cls = autoclass(service_name)
+            service_cls.start(activity, "")
+            print("[app] background service started")
+        except Exception as e:
+            print(f"[app] failed to start bg service: {e}")
 
     def _on_tf(self, _spin, text):
         if self.replay_enabled:
@@ -922,6 +499,7 @@ class SMCAlertApp(App):
             self._notify(at, am)
         self.chart.set_data(data, ov, interval_seconds(tf))
         self.chart.auto_range()
+        self._auto_scroll = True
         n = len(data["time"])
         price = f"${data['close'][-1]:.2f}" if n else ""
         self.status.text = f"{SYMBOL} | {tf} | {n} bars {price}"
@@ -1099,6 +677,8 @@ class SMCAlertApp(App):
         self.replay_info.text = f"{i + 1}/{n} | {ts_str}"
         self.status.text = f"{SYMBOL} | {self.cur_tf} | REPLAY | {i + 1} bars"
 
+    # ── live polling ──
+
     def _poll(self, _dt):
         if self.data is None or self.replay_enabled:
             return
@@ -1147,17 +727,44 @@ class SMCAlertApp(App):
             for at, am in alerts:
                 self._notify(at, am)
             self.chart.set_data(self.data, ov, interval_seconds(self.cur_tf))
+            self._do_auto_scroll()
             n = len(self.data["time"])
             price = f"${self.data['close'][-1]:.2f}" if n else ""
             self.status.text = f"{SYMBOL} | {self.cur_tf} | {n} bars {price}"
-        elif tf_upd and self._last_ov:
+        elif tf_upd:
             now = time.time()
-            if now - self._last_chart_t > 1.0:
-                self.chart.set_data(self.data, self._last_ov, interval_seconds(self.cur_tf))
+            if now - self._last_chart_t > 0.25:
+                if self._last_ov:
+                    self.chart.set_data(self.data, self._last_ov, interval_seconds(self.cur_tf))
+                else:
+                    self.chart._redraw()
+                self._do_auto_scroll()
                 n = len(self.data["time"])
                 price = f"${self.data['close'][-1]:.2f}" if n else ""
                 self.status.text = f"{SYMBOL} | {self.cur_tf} | {price}"
                 self._last_chart_t = now
+
+    def _do_auto_scroll(self):
+        if not self._auto_scroll or self.data is None:
+            return
+        t = self.data["time"]
+        if len(t) == 0:
+            return
+        last_t = float(t[-1])
+        tf_sec = interval_seconds(self.cur_tf)
+        if self.chart.vt1 >= last_t - tf_sec * 3:
+            self.chart.vt1 = last_t + tf_sec * 5
+            visible_bars = max(10, int((self.chart.vt1 - self.chart.vt0) / max(1, tf_sec)))
+            s = max(0, len(t) - visible_bars)
+            vis_h = self.data["high"][s:]
+            vis_l = self.data["low"][s:]
+            if len(vis_h) > 0:
+                new_p1 = float(np.max(vis_h))
+                new_p0 = float(np.min(vis_l))
+                pad = (new_p1 - new_p0) * 0.05
+                self.chart.vp0 = new_p0 - pad
+                self.chart.vp1 = new_p1 + pad
+            self.chart._redraw()
 
     def on_stop(self):
         self._stop_ws()
