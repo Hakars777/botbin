@@ -10,7 +10,7 @@ import numpy as np
 
 from engine import (
     SYMBOL, DEFAULT_TF, HIST_BARS, HAS_WS,
-    fetch_klines, compute_overlays, interval_seconds, ms_to_s,
+    fetch_klines, fetch_latest, compute_overlays, interval_seconds, ms_to_s,
     AlertTracker, KlineWS
 )
 
@@ -180,18 +180,50 @@ def monitor_loop():
                 if alerts:
                     print(f"[service] candle closed, {len(alerts)} alerts sent")
 
-            if not HAS_WS and time.time() - last_recompute > 60:
+            now_t = time.time()
+            poll_interval = 10 if HAS_WS else 5
+            if now_t - last_recompute > poll_interval:
                 try:
-                    data = fetch_klines(SYMBOL, tf, HIST_BARS)
-                    data_4h = fetch_klines(SYMBOL, "4h", max(1000, HIST_BARS // 3))
-                    if len(data["time"]) > 0:
+                    rows = fetch_latest(SYMBOL, tf, 3)
+                    for row in rows:
+                        tt = row["t"]
+                        vals = [row["o"], row["h"], row["l"], row["c"], row["v"]]
+                        if data is None or len(data["time"]) == 0:
+                            continue
+                        last_t = float(data["time"][-1])
+                        if abs(tt - last_t) < 1e-9:
+                            for i, k in enumerate(("open", "high", "low", "close", "volume")):
+                                data[k][-1] = vals[i]
+                        elif tt > last_t:
+                            data["time"] = np.append(data["time"], tt)
+                            for i, k in enumerate(("open", "high", "low", "close", "volume")):
+                                data[k] = np.append(data[k], vals[i])
+                            if len(data["time"]) > HIST_BARS:
+                                for k in data:
+                                    data[k] = data[k][-HIST_BARS:]
+                            tf_closed = True
+                    rows_4h = fetch_latest(SYMBOL, "4h", 3)
+                    for row in rows_4h:
+                        tt = row["t"]
+                        vals = [row["o"], row["h"], row["l"], row["c"], row["v"]]
+                        if data_4h is None or len(data_4h["time"]) == 0:
+                            continue
+                        last_t = float(data_4h["time"][-1])
+                        if abs(tt - last_t) < 1e-9:
+                            for i, k in enumerate(("open", "high", "low", "close", "volume")):
+                                data_4h[k][-1] = vals[i]
+                        elif tt > last_t:
+                            data_4h["time"] = np.append(data_4h["time"], tt)
+                            for i, k in enumerate(("open", "high", "low", "close", "volume")):
+                                data_4h[k] = np.append(data_4h[k], vals[i])
+                    if tf_closed and data is not None and len(data["time"]) > 0:
                         ov = compute_overlays(data, data_4h)
                         alerts = tracker.check(ov)
                         for at, am in alerts:
                             send_notification(at, am)
-                    last_recompute = time.time()
+                    last_recompute = now_t
                 except Exception as e:
-                    print(f"[service] poll error: {e}")
+                    print(f"[service] rest poll error: {e}")
 
         except Exception as e:
             print(f"[service] loop error: {e}")

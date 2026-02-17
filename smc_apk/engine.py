@@ -147,6 +147,23 @@ def fetch_klines(symbol, tf, target_bars):
     }
 
 
+def fetch_latest(symbol, tf, count=3):
+    try:
+        r = requests.get(f"{BINANCE_REST}/api/v3/klines",
+                         params={"symbol": symbol, "interval": tf, "limit": count},
+                         timeout=10)
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return []
+        return [{"t": ms_to_s(int(k[0])),
+                 "o": float(k[1]), "h": float(k[2]),
+                 "l": float(k[3]), "c": float(k[4]),
+                 "v": float(k[5])} for k in rows]
+    except Exception:
+        return []
+
+
 def true_range(h, l, pc):
     return np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
 

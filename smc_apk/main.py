@@ -31,7 +31,7 @@ from engine import (
     SYMBOL, TF_LIST, DEFAULT_TF, HIST_BARS,
     BULLISH, BEARISH, BULLISH_LEG, BEARISH_LEG,
     BOS_TAG, CHOCH_TAG,
-    HAS_WS, interval_seconds, fetch_klines, compute_overlays,
+    HAS_WS, interval_seconds, fetch_klines, fetch_latest, compute_overlays,
     AlertTracker, KlineWS, empty_data
 )
 
@@ -364,8 +364,12 @@ class SMCAlertApp(App):
         self.replay_index = 0
         self._replay_clock = None
 
+        self._rest_busy = False
+        self._last_rest_t = 0
+
         threading.Thread(target=self._load, args=(DEFAULT_TF,), daemon=True).start()
         Clock.schedule_interval(self._poll, 0.1)
+        Clock.schedule_interval(self._rest_poll_tick, 3.0)
 
         Window.bind(on_resize=self._on_window_resize)
 
@@ -743,6 +747,95 @@ class SMCAlertApp(App):
                 price = f"${self.data['close'][-1]:.2f}" if n else ""
                 self.status.text = f"{SYMBOL} | {self.cur_tf} | {price}"
                 self._last_chart_t = now
+
+    # ── REST API polling (primary real-time source) ──
+
+    def _rest_poll_tick(self, _dt):
+        if self.data is None or self.replay_enabled or self._rest_busy:
+            return
+        self._rest_busy = True
+        threading.Thread(target=self._rest_poll_worker, daemon=True).start()
+
+    def _rest_poll_worker(self):
+        try:
+            tf = self.cur_tf
+            rows = fetch_latest(SYMBOL, tf, 3)
+            rows_4h = fetch_latest(SYMBOL, "4h", 3) if tf != "4h" else []
+            if rows:
+                Clock.schedule_once(lambda dt: self._apply_rest(rows, rows_4h, tf))
+            else:
+                self._rest_busy = False
+        except Exception:
+            self._rest_busy = False
+
+    def _apply_rest(self, rows, rows_4h, tf):
+        self._rest_busy = False
+        if self.replay_enabled or self.data is None or tf != self.cur_tf:
+            return
+
+        changed = False
+        new_candle = False
+
+        for row in rows:
+            tt = row["t"]
+            vals = [row["o"], row["h"], row["l"], row["c"], row["v"]]
+            tgt = self.data
+            if tgt is None or len(tgt["time"]) == 0:
+                continue
+            last_t = float(tgt["time"][-1])
+            if abs(tt - last_t) < 1e-9:
+                for i, k in enumerate(("open", "high", "low", "close", "volume")):
+                    if abs(tgt[k][-1] - vals[i]) > 1e-12:
+                        tgt[k][-1] = vals[i]
+                        changed = True
+            elif tt > last_t:
+                tgt["time"] = np.append(tgt["time"], tt)
+                for i, k in enumerate(("open", "high", "low", "close", "volume")):
+                    tgt[k] = np.append(tgt[k], vals[i])
+                if len(tgt["time"]) > HIST_BARS:
+                    for k in tgt:
+                        tgt[k] = tgt[k][-HIST_BARS:]
+                changed = True
+                new_candle = True
+
+        for row in rows_4h:
+            tt = row["t"]
+            vals = [row["o"], row["h"], row["l"], row["c"], row["v"]]
+            tgt = self.data_4h
+            if tgt is None or len(tgt["time"]) == 0:
+                continue
+            last_t = float(tgt["time"][-1])
+            if abs(tt - last_t) < 1e-9:
+                for i, k in enumerate(("open", "high", "low", "close", "volume")):
+                    tgt[k][-1] = vals[i]
+            elif tt > last_t:
+                tgt["time"] = np.append(tgt["time"], tt)
+                for i, k in enumerate(("open", "high", "low", "close", "volume")):
+                    tgt[k] = np.append(tgt[k], vals[i])
+                if len(tgt["time"]) > 4500:
+                    for k in tgt:
+                        tgt[k] = tgt[k][-4500:]
+                new_candle = True
+
+        if not changed and not new_candle:
+            return
+
+        if new_candle:
+            ov = compute_overlays(self.data, self.data_4h)
+            self._last_ov = ov
+            alerts = self.tracker.check(ov)
+            for at, am in alerts:
+                self._notify(at, am)
+            self.chart.set_data(self.data, ov, interval_seconds(self.cur_tf))
+        elif self._last_ov:
+            self.chart.set_data(self.data, self._last_ov, interval_seconds(self.cur_tf))
+        else:
+            self.chart._redraw()
+
+        self._do_auto_scroll()
+        n = len(self.data["time"])
+        price = f"${self.data['close'][-1]:.2f}" if n else ""
+        self.status.text = f"{SYMBOL} | {self.cur_tf} | {n} bars {price}"
 
     def _do_auto_scroll(self):
         if not self._auto_scroll or self.data is None:
