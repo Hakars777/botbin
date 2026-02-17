@@ -53,8 +53,8 @@ class CandleChart(Widget):
         self.vp0 = 0.0
         self.vp1 = 1.0
         self._touches = {}
-        self._pinch_d0 = None
-        self._vsave = None
+        self._pinch_prev = None
+        self._drag_prev = None
         self.bind(size=self._redraw, pos=self._redraw)
 
     def set_data(self, data, overlays, tf_sec):
@@ -262,50 +262,63 @@ class CandleChart(Widget):
         if not self.collide_point(*touch.pos):
             return False
         if hasattr(touch, "is_mouse_scrolling") and touch.is_mouse_scrolling:
-            f = 0.9 if touch.button == "scrollup" else 1.1
-            mt, mp = self.x2t(touch.pos[0]), self.y2p(touch.pos[1])
-            self.vt0 = mt - (mt - self.vt0) * f
-            self.vt1 = mt + (self.vt1 - mt) * f
-            self.vp0 = mp - (mp - self.vp0) * f
-            self.vp1 = mp + (self.vp1 - mp) * f
+            f = 0.93 if touch.button == "scrollup" else 1.07
+            ct = self.x2t(touch.pos[0])
+            cp = self.y2p(touch.pos[1])
+            self.vt0 = ct - (ct - self.vt0) * f
+            self.vt1 = ct + (self.vt1 - ct) * f
+            self.vp0 = cp - (cp - self.vp0) * f
+            self.vp1 = cp + (self.vp1 - cp) * f
             self._redraw()
             return True
         touch.grab(self)
         self._touches[touch.uid] = touch.pos
-        self._vsave = (self.vt0, self.vt1, self.vp0, self.vp1)
         if len(self._touches) == 2:
             pts = list(self._touches.values())
-            self._pinch_d0 = math.dist(pts[0], pts[1])
+            self._pinch_prev = math.dist(pts[0], pts[1])
+        elif len(self._touches) == 1:
+            self._drag_prev = touch.pos
         return True
 
     def on_touch_move(self, touch):
         if touch.grab_current is not self:
             return False
         self._touches[touch.uid] = touch.pos
-        if self._vsave is None:
-            return True
-        vt0, vt1, vp0, vp1 = self._vsave
+
         if len(self._touches) == 1:
-            dx = touch.pos[0] - touch.opos[0]
-            dy = touch.pos[1] - touch.opos[1]
-            tr, pr = vt1 - vt0, vp1 - vp0
-            self.vt0 = vt0 - dx / max(1, self.width) * tr
-            self.vt1 = vt1 - dx / max(1, self.width) * tr
-            self.vp0 = vp0 - dy / max(1, self.height) * pr
-            self.vp1 = vp1 - dy / max(1, self.height) * pr
+            prev = self._drag_prev
+            if prev is None:
+                self._drag_prev = touch.pos
+                return True
+            dx = touch.pos[0] - prev[0]
+            dy = touch.pos[1] - prev[1]
+            tr = self.vt1 - self.vt0
+            pr = self.vp1 - self.vp0
+            self.vt0 -= dx / max(1, self.width) * tr
+            self.vt1 -= dx / max(1, self.width) * tr
+            self.vp0 -= dy / max(1, self.height) * pr
+            self.vp1 -= dy / max(1, self.height) * pr
+            self._drag_prev = touch.pos
             self._redraw()
-        elif len(self._touches) == 2 and self._pinch_d0 and self._pinch_d0 > 10:
+
+        elif len(self._touches) == 2:
             pts = list(self._touches.values())
             d = math.dist(pts[0], pts[1])
-            if d < 10:
-                return True
-            s = self._pinch_d0 / d
-            tc, pc = (vt0 + vt1) / 2, (vp0 + vp1) / 2
-            self.vt0 = tc - (vt1 - vt0) / 2 * s
-            self.vt1 = tc + (vt1 - vt0) / 2 * s
-            self.vp0 = pc - (vp1 - vp0) / 2 * s
-            self.vp1 = pc + (vp1 - vp0) / 2 * s
-            self._redraw()
+            cx = (pts[0][0] + pts[1][0]) * 0.5
+            cy = (pts[0][1] + pts[1][1]) * 0.5
+
+            if self._pinch_prev and self._pinch_prev > 5 and d > 5:
+                raw = self._pinch_prev / d
+                s = 1.0 + (raw - 1.0) * 0.6
+                ct = self.x2t(cx)
+                cp = self.y2p(cy)
+                self.vt0 = ct - (ct - self.vt0) * s
+                self.vt1 = ct + (self.vt1 - ct) * s
+                self.vp0 = cp - (cp - self.vp0) * s
+                self.vp1 = cp + (self.vp1 - cp) * s
+                self._redraw()
+
+            self._pinch_prev = d
         return True
 
     def on_touch_up(self, touch):
@@ -314,8 +327,12 @@ class CandleChart(Widget):
         touch.ungrab(self)
         self._touches.pop(touch.uid, None)
         if not self._touches:
-            self._vsave = None
-            self._pinch_d0 = None
+            self._pinch_prev = None
+            self._drag_prev = None
+        elif len(self._touches) == 1:
+            self._pinch_prev = None
+            remaining = list(self._touches.values())
+            self._drag_prev = remaining[0] if remaining else None
         return True
 
 
