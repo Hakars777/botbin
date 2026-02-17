@@ -3,8 +3,8 @@ title = SMC Alert
 package.name = smcalert
 package.domain = org.smcalert
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas
-version = 1.1.0
+source.include_exts = py,png,jpg,kv,atlas,java
+version = 1.2.0
 requirements = python3,kivy,numpy,requests,websocket-client,plyer,certifi,urllib3,charset-normalizer,idna,pyjnius
 
 orientation = portrait, landscape
@@ -18,6 +18,9 @@ android.accept_sdk_license = True
 p4a.branch = develop
 
 services = Monitor:service.py:foreground
+
+android.add_src = java_src
+android.extra_manifest_application_arguments = <receiver android:name=".BootReceiver" android:enabled="true" android:exported="true" android:directBootAware="false"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /><action android:name="android.intent.action.QUICKBOOT_POWERON" /></intent-filter></receiver>
 
 [buildozer]
 log_level = 2
