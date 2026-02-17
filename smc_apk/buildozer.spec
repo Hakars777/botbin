@@ -20,7 +20,7 @@ p4a.branch = develop
 services = Monitor:service.py:foreground
 
 android.add_src = java_src
-android.extra_manifest_application_arguments = <receiver android:name=".BootReceiver" android:enabled="true" android:exported="true" android:directBootAware="false"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /><action android:name="android.intent.action.QUICKBOOT_POWERON" /></intent-filter></receiver>
+android.extra_manifest_application_arguments = extra_manifest.xml
 
 [buildozer]
 log_level = 2
