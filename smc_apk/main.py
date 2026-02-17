@@ -20,6 +20,8 @@ from kivy.uix.widget import Widget
 from kivy.uix.spinner import Spinner
 from kivy.uix.label import Label
 from kivy.uix.button import Button
+from kivy.uix.togglebutton import ToggleButton
+from kivy.uix.slider import Slider
 from kivy.graphics import Color, Rectangle, Line
 from kivy.core.text import Label as CoreLabel
 from kivy.clock import Clock
@@ -821,6 +823,50 @@ class SMCAlertApp(App):
         top.add_widget(fit_btn)
 
         root.add_widget(top)
+
+        # ── replay bar ──
+        rbar = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
+
+        self.replay_toggle = ToggleButton(text="Replay", size_hint_x=None, width=dp(70),
+                                          font_size=sp(12))
+        self.replay_toggle.bind(state=self._on_replay_toggle)
+        rbar.add_widget(self.replay_toggle)
+
+        self.replay_play_btn = Button(text="Play", size_hint_x=None, width=dp(55),
+                                      font_size=sp(12), disabled=True)
+        self.replay_play_btn.bind(on_press=self._on_replay_play)
+        rbar.add_widget(self.replay_play_btn)
+
+        self.replay_back_btn = Button(text="<<", size_hint_x=None, width=dp(40),
+                                      font_size=sp(13), disabled=True)
+        self.replay_back_btn.bind(on_press=lambda *_: self._replay_step(-1))
+        rbar.add_widget(self.replay_back_btn)
+
+        self.replay_fwd_btn = Button(text=">>", size_hint_x=None, width=dp(40),
+                                     font_size=sp(13), disabled=True)
+        self.replay_fwd_btn.bind(on_press=lambda *_: self._replay_step(+1))
+        rbar.add_widget(self.replay_fwd_btn)
+
+        rbar.add_widget(Label(text="Spd:", size_hint_x=None, width=dp(30),
+                              color=(1, 1, 1, 0.6), font_size=sp(11)))
+        self.replay_speed_spin = Spinner(text="10", values=[str(x) for x in
+                                         [1, 2, 5, 10, 20, 50, 100]],
+                                         size_hint_x=None, width=dp(55), font_size=sp(12))
+        self.replay_speed_spin.disabled = True
+        rbar.add_widget(self.replay_speed_spin)
+
+        self.replay_slider = Slider(min=0, max=0, value=0, step=1, disabled=True)
+        self.replay_slider.bind(value=self._on_replay_slider)
+        rbar.add_widget(self.replay_slider)
+
+        self.replay_info = Label(text="", size_hint_x=None, width=dp(180),
+                                 halign="right", valign="middle",
+                                 color=(1, 1, 1, 0.6), font_size=sp(11))
+        self.replay_info.bind(size=self.replay_info.setter("text_size"))
+        rbar.add_widget(self.replay_info)
+
+        root.add_widget(rbar)
+
         self.chart = CandleChart()
         root.add_widget(self.chart)
 
@@ -829,16 +875,27 @@ class SMCAlertApp(App):
         self.ws_4h = None
         self.data = None
         self.data_4h = None
+        self.data_full = None
+        self.data_4h_full = None
         self.tracker = AlertTracker()
         self.cur_tf = DEFAULT_TF
         self._last_ov = None
         self._last_chart_t = 0
+
+        # replay state
+        self.replay_enabled = False
+        self.replay_playing = False
+        self.replay_index = 0
+        self._replay_clock = None
 
         threading.Thread(target=self._load, args=(DEFAULT_TF,), daemon=True).start()
         Clock.schedule_interval(self._poll, 0.1)
         return root
 
     def _on_tf(self, _spin, text):
+        if self.replay_enabled:
+            self.replay_toggle.state = "normal"
+            self._on_replay_toggle(self.replay_toggle, "normal")
         self.cur_tf = text
         self.status.text = "Loading..."
         self._stop_ws()
@@ -855,6 +912,8 @@ class SMCAlertApp(App):
     def _loaded(self, tf, data, data_4h):
         self.data = data
         self.data_4h = data_4h
+        self.data_full = {k: v.copy() for k, v in data.items()}
+        self.data_4h_full = {k: v.copy() for k, v in data_4h.items()}
         self.cur_tf = tf
         ov = compute_overlays(data, data_4h)
         self._last_ov = ov
@@ -890,8 +949,158 @@ class SMCAlertApp(App):
             except Exception:
                 pass
 
+    # ── replay ──
+
+    def _on_replay_toggle(self, inst, state):
+        enabled = (state == "down")
+        self.replay_enabled = enabled
+        self.replay_playing = False
+        if self._replay_clock:
+            self._replay_clock.cancel()
+            self._replay_clock = None
+        self.replay_play_btn.text = "Play"
+
+        if enabled:
+            self._stop_ws()
+            try:
+                while True:
+                    self.q.get_nowait()
+            except Empty:
+                pass
+
+            self.tf_spin.disabled = True
+            self.replay_play_btn.disabled = False
+            self.replay_back_btn.disabled = False
+            self.replay_fwd_btn.disabled = False
+            self.replay_speed_spin.disabled = False
+            self.replay_slider.disabled = False
+
+            n = len(self.data_full["time"]) if self.data_full else 0
+            if n <= 0:
+                self.replay_slider.max = 0
+                self.replay_index = 0
+                self.replay_info.text = ""
+                return
+            self.replay_slider.max = n - 1
+            self.replay_index = n - 1
+            self.replay_slider.value = self.replay_index
+            self._apply_replay_view()
+        else:
+            self.tf_spin.disabled = False
+            self.replay_play_btn.disabled = True
+            self.replay_back_btn.disabled = True
+            self.replay_fwd_btn.disabled = True
+            self.replay_speed_spin.disabled = True
+            self.replay_slider.disabled = True
+            self.replay_info.text = ""
+            tf_now = self.cur_tf
+            self._stop_ws()
+            threading.Thread(target=self._load, args=(tf_now,), daemon=True).start()
+
+    def _on_replay_play(self, *_):
+        if not self.replay_enabled:
+            return
+        self.replay_playing = not self.replay_playing
+        if self.replay_playing:
+            self.replay_play_btn.text = "Pause"
+            self._start_replay_timer()
+        else:
+            self.replay_play_btn.text = "Play"
+            if self._replay_clock:
+                self._replay_clock.cancel()
+                self._replay_clock = None
+
+    def _start_replay_timer(self):
+        if self._replay_clock:
+            self._replay_clock.cancel()
+        try:
+            spd = max(1, int(self.replay_speed_spin.text))
+        except ValueError:
+            spd = 10
+        interval = max(0.01, 1.0 / spd)
+        self._replay_clock = Clock.schedule_interval(self._replay_tick, interval)
+
+    def _replay_tick(self, _dt):
+        if not self.replay_enabled or not self.replay_playing:
+            if self._replay_clock:
+                self._replay_clock.cancel()
+                self._replay_clock = None
+            return
+        n = len(self.data_full["time"]) if self.data_full else 0
+        if n <= 0 or self.replay_index >= n - 1:
+            self.replay_playing = False
+            self.replay_play_btn.text = "Play"
+            if self._replay_clock:
+                self._replay_clock.cancel()
+                self._replay_clock = None
+            return
+        self._replay_step(+1)
+
+    def _replay_step(self, delta):
+        if not self.replay_enabled or self.data_full is None:
+            return
+        n = len(self.data_full["time"])
+        if n <= 0:
+            return
+        new_i = int(np.clip(self.replay_index + delta, 0, n - 1))
+        if new_i == self.replay_index:
+            return
+        self.replay_index = new_i
+        self.replay_slider.value = new_i
+        self._apply_replay_view()
+
+    def _on_replay_slider(self, inst, value):
+        if not self.replay_enabled:
+            return
+        idx = int(value)
+        if idx == self.replay_index:
+            return
+        self.replay_index = idx
+        self._apply_replay_view()
+
+    def _apply_replay_view(self):
+        if self.data_full is None:
+            return
+        n = len(self.data_full["time"])
+        if n <= 0:
+            return
+        i = int(np.clip(self.replay_index, 0, n - 1))
+        view = {k: v[:i + 1].copy() for k, v in self.data_full.items()}
+        if len(view["time"]) == 0:
+            return
+        t_last = float(view["time"][-1])
+        if self.data_4h_full is not None and len(self.data_4h_full["time"]) > 0:
+            mask = self.data_4h_full["time"] <= t_last
+            view_4h = {k: v[mask].copy() for k, v in self.data_4h_full.items()}
+        else:
+            view_4h = self.data_4h_full
+
+        tf_sec = interval_seconds(self.cur_tf)
+        ov = compute_overlays(view, view_4h)
+        self.chart.set_data(view, ov, tf_sec)
+
+        if self.replay_playing:
+            show = min(200, i + 1)
+            s = max(0, i + 1 - show)
+            self.chart.vt0 = float(view["time"][s])
+            self.chart.vt1 = float(view["time"][-1]) + tf_sec * 5
+            self.chart.vp0 = float(np.min(view["low"][s:]))
+            self.chart.vp1 = float(np.max(view["high"][s:]))
+            pad = (self.chart.vp1 - self.chart.vp0) * 0.05
+            self.chart.vp0 -= pad
+            self.chart.vp1 += pad
+            self.chart._redraw()
+
+        try:
+            dt = datetime.fromtimestamp(t_last, tz=timezone.utc)
+            ts_str = dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            ts_str = ""
+        self.replay_info.text = f"{i + 1}/{n} | {ts_str}"
+        self.status.text = f"{SYMBOL} | {self.cur_tf} | REPLAY | {i + 1} bars"
+
     def _poll(self, _dt):
-        if self.data is None:
+        if self.data is None or self.replay_enabled:
             return
         tf_upd = False
         tf_closed = False
