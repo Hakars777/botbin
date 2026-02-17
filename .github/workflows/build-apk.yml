@@ -46,11 +46,23 @@ jobs:
       - name: Build APK
         working-directory: smc_apk
         run: |
-          yes | buildozer android debug 2>&1 | tail -100
+          set -o pipefail
+          buildozer android debug 2>&1 | tee /tmp/buildozer.log
+          echo "Build exit code: $?"
+
+      - name: Show errors if failed
+        if: failure()
+        run: |
+          echo "=== LAST 200 LINES ==="
+          tail -200 /tmp/buildozer.log || true
+          echo "=== GREP ERRORS ==="
+          grep -i -E "error|fatal|exception|traceback|failed" /tmp/buildozer.log | tail -50 || true
 
       - name: Upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: smc-alert-apk
           path: smc_apk/bin/*.apk
           retention-days: 30
+          if-no-files-found: warn
