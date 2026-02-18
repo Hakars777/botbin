@@ -34,7 +34,7 @@ jobs:
       - name: Install buildozer
         run: |
           pip install --upgrade pip setuptools wheel
-          pip install --upgrade buildozer cython virtualenv
+          pip install --upgrade buildozer "cython<3" virtualenv
 
       - name: Setup Android SDK for buildozer
         run: |
