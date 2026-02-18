@@ -1,0 +1,103 @@
+name: Build All Signal APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'all_apk/**'
+      - '.github/workflows/build-all-apk.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git zip unzip \
+            python3-dev libffi-dev libssl-dev \
+            autoconf automake libtool libtool-bin libltdl-dev \
+            pkg-config cmake zlib1g-dev ccache lld
+          sudo apt-get install -y openjdk-17-jdk || sudo apt-get install -y default-jdk
+
+      - name: Install buildozer
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install --upgrade buildozer cython virtualenv
+
+      - name: Cache buildozer
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            all_apk/.buildozer
+          key: buildozer-allsig-v1-${{ runner.os }}-${{ hashFiles('all_apk/buildozer.spec') }}
+          restore-keys: |
+            buildozer-allsig-v1-${{ runner.os }}-
+
+      - name: Build APK
+        working-directory: all_apk
+        run: |
+          set -o pipefail
+          buildozer android debug 2>&1 | tee /tmp/buildozer.log
+          echo "Build exit code: $?"
+
+      - name: Patch manifest and rebuild with BootReceiver
+        working-directory: all_apk
+        run: |
+          DIST_DIR=".buildozer/android/platform/build-arm64-v8a/dists/allsignal"
+          MANIFEST="$DIST_DIR/src/main/AndroidManifest.xml"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "Manifest not found, skipping patch"
+            exit 0
+          fi
+          if grep -q "BootReceiver" "$MANIFEST"; then
+            echo "BootReceiver already in manifest"
+          else
+            echo "Injecting BootReceiver into AndroidManifest.xml"
+            RECEIVER='<receiver android:name=".BootReceiver" android:enabled="true" android:exported="true"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" \/><action android:name="android.intent.action.QUICKBOOT_POWERON" \/><\/intent-filter><\/receiver>'
+            sed -i "s|</application>|${RECEIVER}</application>|" "$MANIFEST"
+            echo "Manifest patched. Rebuilding APK..."
+            cd "$DIST_DIR"
+            ./gradlew assembleDebug 2>&1 | tail -30
+            echo "Gradle rebuild exit code: $?"
+          fi
+
+      - name: Copy rebuilt APK
+        working-directory: all_apk
+        run: |
+          mkdir -p bin
+          REBUILT=".buildozer/android/platform/build-arm64-v8a/dists/allsignal/build/outputs/apk/debug/allsignal-debug.apk"
+          if [ -f "$REBUILT" ]; then
+            cp "$REBUILT" bin/allsignal-1.0.0-arm64-v8a-debug.apk
+            echo "Copied rebuilt APK with BootReceiver"
+          fi
+          ls -la bin/*.apk || true
+
+      - name: Show errors if failed
+        if: failure()
+        run: |
+          echo "=== LAST 200 LINES ==="
+          tail -200 /tmp/buildozer.log || true
+          echo "=== GREP ERRORS ==="
+          grep -i -E "error|fatal|exception|traceback|failed" /tmp/buildozer.log | tail -50 || true
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-signal-apk
+          path: all_apk/bin/*.apk
+          retention-days: 30
+          if-no-files-found: warn
